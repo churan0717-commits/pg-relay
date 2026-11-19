@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    ports:
+      - "18901:18901"
+    volumes:
+      - relay-data:/app/relay/data
+      - headless-data:/app/headless/runtime
+
+volumes:
+  relay-data:
+  headless-data:

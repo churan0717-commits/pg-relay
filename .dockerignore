@@ -1,0 +1,16 @@
+# 构建上下文瘦身（上下文 = 本 cloady/ 目录）
+*.md
+prepare.sh
+.dockerignore
+# app/ 里若混入本机产物，一律不进镜像（配置由 start.sh 按环境变量生成）
+app/node_modules
+app/config.json
+app/headless.json
+app/current-url.txt
+app/data
+app/mock
+app/tools
+app/systemd
+app/ngrok
+app/proxy.env
+app/tunnel.log

@@ -1,0 +1,10 @@
+{
+  "name": "pg-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Catiecli script-protocol compatible backend (WS executor mode)",
+  "main": "src/server.js",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

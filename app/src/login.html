@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>蜜桃可可</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; padding: 24px 16px; line-height: 1.5; min-height: 100vh; color: #5b3a29; background: #ffe9d6 url('/peach.webp') center top / cover no-repeat fixed; }
+  body::before { content: ''; position: fixed; inset: 0; background: linear-gradient(180deg, rgba(255,248,239,.04) 0%, rgba(255,248,239,.34) 48%, rgba(255,233,214,.9) 100%); pointer-events: none; }
+  .box { position: relative; max-width: 420px; margin: 9vh auto 0; background: rgba(255,252,248,.82); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,.6); border-radius: 24px; padding: 26px 22px; box-shadow: 0 12px 40px rgba(91,58,41,.18); }
+  h1 { font-size: 24px; letter-spacing: 4px; text-align: center; color: #5b3a29; margin: 0 0 4px; }
+  .sub { text-align: center; color: #a0714f; font-size: 13px; letter-spacing: 2px; margin: 0 0 18px; }
+  label { font-size: 13px; color: #a0714f; display: block; margin-bottom: 6px; }
+  input[type=text] { width: 100%; padding: 12px 18px; border: 1px solid #f3ddc8; border-radius: 99px; font-size: 15px; background: rgba(255,255,255,.85); color: #5b3a29; }
+  input[type=text]:focus { outline: 2px solid #ffb08e; border-color: #ff9e7a; }
+  button { width: 100%; margin-top: 14px; padding: 12px 14px; border-radius: 99px; border: none; background: linear-gradient(135deg, #ff9e7a, #ff7e5f); box-shadow: 0 6px 16px rgba(255,126,95,.35); color: #fff; font-size: 15px; cursor: pointer; }
+  button:disabled { opacity: .45; }
+  .masked { -webkit-text-security: disc; }
+  #loginMsg { min-height: 20px; font-size: 14px; margin: 10px 0 0; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>蜜桃可可</h1>
+  <p class="sub">一杯甜 · 慢慢品</p>
+  <label for="pw">站长口令</label>
+  <input id="pw" type="text" class="masked" placeholder="输入站长口令" autocomplete="current-password" autocapitalize="off" lang="zh-CN">
+  <button id="loginBtn">登录</button>
+  <p id="loginMsg"></p>
+</div>
+<script>
+const pwInput = document.getElementById('pw');
+const btn = document.getElementById('loginBtn');
+const msg = document.getElementById('loginMsg');
+async function doLogin() {
+  const pw = pwInput.value;
+  if (!pw) { msg.textContent = '先输入站长口令。'; return; }
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/console/owner/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ password: pw }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((d.error && d.error.message) || ('HTTP ' + r.status));
+    location.replace('/');
+  } catch (e) {
+    msg.textContent = '登录失败：' + e.message;
+    btn.disabled = false;
+  }
+}
+btn.onclick = doLogin;
+pwInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+pwInput.focus();
+</script>
+</body>
+</html>
