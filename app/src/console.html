@@ -115,14 +115,14 @@
   <div id="hlAccounts"></div>
   <p class="hint" id="hlLastPush"></p>
   <div class="row"><button class="secondary" id="hlStart">启动生成服务</button></div>
-  <label style="margin-top:12px">自带代理（可选）：账户邮箱（留空 = 默认，对未单独绑定的账户生效）</label>
-  <input id="proxyEmail" type="text" placeholder="user@example.com（可留空）" autocomplete="off">
+  <label style="margin-top:12px">自带代理（可选）：账户（下拉选择；选「（默认）」对未单独绑定的账户生效）</label>
+  <select id="proxyEmail" style="width:100%"><option value="">（默认）未单独绑定的账户</option></select>
   <label style="margin-top:8px">代理地址（留空保存 = 清除绑定）</label>
   <div class="row">
     <input id="proxyBox" type="text" class="grow mono" placeholder="如 http://user:pass@host:port 或 socks5://host:port" autocomplete="off">
     <button class="secondary" id="saveProxy">保存代理</button>
   </div>
-  <p class="hint">代理保存在本服务，按邮箱与账户绑定：<b>已导入的账户保存后立即写入账户配置生效</b>（账户会以新代理重启，下一次请求短暂预热），不用重新推送 Cookie；尚未导入的账户在首次推送时生效。留空邮箱保存的是默认代理，在未单独绑定的账户下次推送时生效。当前已保存：<span id="proxySaved" class="mono"></span></p>
+  <p class="hint">代理保存在本服务，按邮箱与账户绑定：<b>已导入的账户保存后立即写入账户配置生效</b>（账户会以新代理重启，下一次请求短暂预热），不用重新推送 Cookie；尚未导入的账户在首次推送时生效。选「（默认）」保存的是默认代理，在未单独绑定的账户下次推送时生效。当前已保存：<span id="proxySaved" class="mono"></span></p>
   <label style="margin-top:12px">手动导入 Cookie（无法用脚本推送时，如 iOS 浏览器）</label>
   <textarea id="manualCookie" placeholder="把 Cookie 粘贴到这里：支持 a=b; c=d; ... 形式，也支持 [{name, value, ...}] 的 JSON 数组" autocomplete="off" spellcheck="false"></textarea>
   <div class="row" style="margin-top:8px"><button class="secondary" id="manualImport">导入 Cookie</button></div>
@@ -232,6 +232,7 @@ function renderHeadless(h) {
     $('poolAssign').innerHTML = '';
     $('subNodeList').innerHTML = '';
     $('subAcct').innerHTML = '';
+    $('proxyEmail').innerHTML = '<option value="">（默认）未单独绑定的账户</option>';
     return;
   }
   const accounts = h.accounts || [];
@@ -357,6 +358,13 @@ function renderSubNodes(h) {
     setSubNodeMsg('');
     if (lastHeadless) renderSubNodes(lastHeadless);
   };
+  // 自带代理表单的账户下拉与订阅卡共用同一份账号列表（同一 emails），永远同步；
+  // 第一项恒为「（默认）」(value="")；刷新重建时保留当前选择，被删账号则回落默认。
+  const pSel = $('proxyEmail');
+  const prevProxyEmail = pSel.value;
+  pSel.innerHTML = '<option value="">（默认）未单独绑定的账户</option>'
+    + emails.map((em) => `<option value="${esc(em)}">${esc(em)}</option>`).join('');
+  pSel.value = emails.includes(prevProxyEmail) ? prevProxyEmail : '';
   const nodes = poolCache.filter((p) => p.source === 'clash');
   const box = $('subNodeList');
   if (!nodes.length) {
