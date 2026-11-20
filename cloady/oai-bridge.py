@@ -29,6 +29,19 @@ FINISH = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "content_filter",
 # 关闭 B；客户端自己带 tools 时不注入。
 TOOL_TRANSPORT = os.environ.get("OAI_BRIDGE_TOOL_TRANSPORT", "on") != "off"
 ANTI_TRUNC_MAX = int(os.environ.get("OAI_BRIDGE_ANTI_TRUNC_MAX", "3"))
+# 启用方式与 su-kaka 对齐：模型名前缀标注（agy2api 用「抗截断-」、gcli2api 用
+# 「抗截断/」），本站用「防截断-」为主、另两种写法也认。带前缀才走 B 并剥掉
+# 前缀再打上游；不带前缀的模型名行为与原来完全一致。/v1/models 会多列一份
+# 带前缀的模型，酒馆下拉里能直接选。
+ANTI_PREFIXES = ("防截断-", "抗截断-", "抗截断/")
+
+
+def split_anti_prefix(model):
+    """(剥掉防截断前缀的模型名, 是否带前缀)"""
+    for p in ANTI_PREFIXES:
+        if model.startswith(p):
+            return model[len(p):], True
+    return model, False
 _TOOL_WORDS = ("emit", "relay", "convey", "deliver", "transmit", "present")
 CONTINUATION_PROMPT = ("【系统提示】你上一段回复在发送途中被中断了。请从中断处紧接着继续："
                        "不要重复已经写过的内容，不要道歉、不要解释、不要重新开头。")
@@ -535,8 +548,17 @@ class H(BaseHTTPRequestHandler):
             if code != 200:
                 return self.err(code, g)
             ids = [m.get("name", "").removeprefix("models/") for m in g.get("models", [])]
-            return self.send(200, {"object": "list", "data": [
-                {"id": i, "object": "model", "created": 0, "owned_by": "google"} for i in ids if i]})
+            data = []
+            for i in ids:
+                if not i:
+                    continue
+                data.append({"id": i, "object": "model", "created": 0, "owned_by": "google"})
+                # 每个文本模型多列一个「防截断-」版（走 B 通道），酒馆下拉里直接可选
+                if i.startswith("gemini-") and not any(
+                        s in i for s in ("image", "tts", "embedding", "embed")):
+                    data.append({"id": "防截断-" + i, "object": "model",
+                                 "created": 0, "owned_by": "google"})
+            return self.send(200, {"object": "list", "data": data})
         if path == "/health":
             return self.send(200, {"ok": True, "upstream": UPSTREAM})
         if path == "/usage":
@@ -563,11 +585,12 @@ class H(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
         except ValueError:
             return self.send(400, {"error": {"message": "bad json"}})
-        model = str(body.get("model") or "gemini-2.5-flash").removeprefix("models/")
-        use_tool = TOOL_TRANSPORT and not body.get("tools") \
+        label = str(body.get("model") or "gemini-2.5-flash").removeprefix("models/")
+        model, anti = split_anti_prefix(label)
+        use_tool = anti and TOOL_TRANSPORT and not body.get("tools") \
             and not body.get("tool_choice") and not body.get("functions")
         if body.get("stream"):
-            return self.stream(model, to_gemini(body), use_tool)
+            return self.stream(model, to_gemini(body), use_tool, label)
         greq = to_gemini(body)
         name = new_tool_name() if use_tool else None
         greq_plain = greq
@@ -589,7 +612,7 @@ class H(BaseHTTPRequestHandler):
                 if cont > 0 and acc_text:
                     finish = "length"  # 续写请求失败：把已收到的部分交出去，好过报错
                     break
-                record_usage(model, "oai", total_usage, None, int((time.time() - t0) * 1000), False, "",
+                record_usage(label, "oai", total_usage, None, int((time.time() - t0) * 1000), False, "",
                              (g.get("error") or {}).get("message", "") if isinstance(g.get("error"), dict) else "", cont)
                 return self.err(code, g)
             _sum_usage(total_usage, g.get("usageMetadata"))
@@ -613,16 +636,17 @@ class H(BaseHTTPRequestHandler):
                 _sum_usage(total_usage, g.get("usageMetadata"))
                 acc_text, finish = from_gemini(g)
         dur_ms = int((time.time() - t0) * 1000)
-        record_usage(model, "oai", total_usage, None, dur_ms, True, finish, "", cont)
+        record_usage(label, "oai", total_usage, None, dur_ms, True, finish, "", cont)
         self.send(200, {"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion",
-                        "created": int(time.time()), "model": model,
+                        "created": int(time.time()), "model": label,
                         "choices": [{"index": 0, "message": {"role": "assistant", "content": acc_text},
                                      "finish_reason": finish}],
                         "usage": {"prompt_tokens": total_usage.get("promptTokenCount", 0),
                                   "completion_tokens": total_usage.get("candidatesTokenCount", 0),
                                   "total_tokens": total_usage.get("totalTokenCount", 0)}})
 
-    def stream(self, model, payload, use_tool=False):
+    def stream(self, model, payload, use_tool=False, label=None):
+        label = label or model
         t0 = time.time()
         name = new_tool_name() if use_tool else None
         plain_payload = payload
@@ -648,7 +672,7 @@ class H(BaseHTTPRequestHandler):
         # 首轮在发响应头之前打开：上游报错还能按 HTTP 错误返回（与旧行为一致）
         resp, ecode, gerr = open_upstream(payload)
         if resp is None:
-            record_usage(model, "oai-stream", {}, None, int((time.time() - t0) * 1000), False, "",
+            record_usage(label, "oai-stream", {}, None, int((time.time() - t0) * 1000), False, "",
                          (gerr.get("error") or {}).get("message", "") if isinstance(gerr.get("error"), dict) else "")
             return self.err(ecode, gerr)
         self.send_response(200)
@@ -659,7 +683,7 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         base = {"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion.chunk",
-                "created": int(time.time()), "model": model}
+                "created": int(time.time()), "model": label}
 
         def emit(delta, fin=None):
             chunk = dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": fin}])
@@ -782,7 +806,7 @@ class H(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             disconnected = True
-        record_usage(model, "oai-stream", total_usage,
+        record_usage(label, "oai-stream", total_usage,
                      int((t_first - t0) * 1000) if t_first else None,
                      int((time.time() - t0) * 1000),
                      not stream_err and not disconnected, finish or "",
