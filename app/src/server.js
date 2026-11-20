@@ -133,6 +133,651 @@ function saveRobinState() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 反重力通道（agy）：Google Antigravity 的 OAuth 凭证池，与 pggo 的 Cookie
+// 池、Robin 的主令牌池完全分开存（data/agy-state.json，600 权限）、分开
+// 用——哪个通道只从自己池子里取凭证，绝不串（用户 2026-11-20 拍板的通
+// 道隔离铁律）。协议对齐两家开源实现（CLIProxyAPI、gcl2api）的公开代码：
+// Antigravity 应用内置 OAuth client（公开常量，非用户凭证）拿授权码换
+// refresh_token 长期保存，生成时换 access_token 调 cloudcode-pa 的
+// v1internal 接口（loadCodeAssist 取 project/档位、fetchAvailableModels
+// 取模型、generateContent 生成）。管理台只显示邮箱/档位/project/模型数，
+// 令牌本体永不回传。
+// ---------------------------------------------------------------------------
+const AGY_STATE_PATH = path.join(DATA_DIR, 'agy-state.json');
+let agyState = { accounts: {} }; // email -> { refreshToken, accessToken, accessExp, projectId, tier, enabled, status, models, cooldownUntil, boundAt, updatedAt }
+try {
+  const saved = JSON.parse(fs.readFileSync(AGY_STATE_PATH, 'utf8'));
+  if (saved && typeof saved === 'object' && saved.accounts && typeof saved.accounts === 'object') {
+    agyState = { accounts: saved.accounts };
+  }
+} catch {}
+function saveAgyState() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(AGY_STATE_PATH, JSON.stringify(agyState, null, 2) + '\n', { mode: 0o600 });
+  } catch (e) {
+    console.error('[pg-relay] agy 状态落盘失败', e.message);
+  }
+}
+
+const AGY_CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com';
+const AGY_CLIENT_SECRET = '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';
+const AGY_SCOPES = [
+  'https://www.googleapis.com/auth/cloud-platform',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile',
+  'https://www.googleapis.com/auth/aicode',
+  'https://www.googleapis.com/auth/cclog',
+  'https://www.googleapis.com/auth/experimentsandconfigs',
+];
+const AGY_REDIRECT_URI = 'http://localhost:51121/oauth-callback';
+const AGY_HOSTS = ['https://daily-cloudcode-pa.googleapis.com', 'https://cloudcode-pa.googleapis.com'];
+const AGY_UA = 'antigravity/hub/2.31.0 (aidev_client; os_type=WIN32; arch=x64; cl=1017595969)';
+// 账号还没绑定拉不到真实模型表时的兜底清单（Antigravity 公开模型 id）；
+// 绑定成功会用 fetchAvailableModels 的真实结果替换。
+const AGY_SEED_MODELS = [
+  'gemini-3-pro-high', 'gemini-3-pro-low', 'gemini-3-flash', 'gemini-3.1-flash-lite',
+  'claude-sonnet-4-5', 'claude-sonnet-4-5-thinking', 'claude-opus-4-5-thinking',
+  'gpt-oss-120b-medium',
+];
+
+function isAgyModel(raw) {
+  return String(raw || '').trim().replace(/^models\//, '').startsWith('agy-');
+}
+
+function agyModelIds() {
+  const set = new Set();
+  for (const a of Object.values(agyState.accounts)) {
+    if (a && Array.isArray(a.models)) for (const m of a.models) set.add(m);
+  }
+  if (!set.size) for (const m of AGY_SEED_MODELS) set.add(m);
+  return [...set];
+}
+
+function agyAuthUrl() {
+  const params = new URLSearchParams({
+    client_id: AGY_CLIENT_ID,
+    redirect_uri: AGY_REDIRECT_URI,
+    response_type: 'code',
+    access_type: 'offline',
+    prompt: 'consent',
+    scope: AGY_SCOPES.join(' '),
+    state: crypto.randomBytes(8).toString('hex'),
+  });
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+async function agyTokenRequest(fields) {
+  let r;
+  try {
+    r = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(fields).toString(),
+      signal: AbortSignal.timeout(30000),
+    });
+  } catch (e) {
+    const err = new Error(`连接谷歌令牌端点失败：${e.message}`);
+    err.status = 502;
+    throw err;
+  }
+  const text = await r.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch {}
+  if (!r.ok) {
+    const err = new Error(`谷歌令牌端点拒绝（${r.status}）：${(data && (data.error_description || data.error)) || text.slice(0, 200)}`);
+    err.status = r.status;
+    err.googleError = data && data.error;
+    throw err;
+  }
+  return data;
+}
+
+async function agyEnsureAccessToken(email) {
+  const a = agyState.accounts[email];
+  if (!a || !a.refreshToken) throw new Error(`agy 账号不存在或缺 refresh_token：${email}`);
+  if (a.accessToken && a.accessExp && a.accessExp > Date.now() + 120000) return a.accessToken;
+  const tok = await agyTokenRequest({
+    refresh_token: a.refreshToken,
+    client_id: AGY_CLIENT_ID,
+    client_secret: AGY_CLIENT_SECRET,
+    grant_type: 'refresh_token',
+  });
+  a.accessToken = tok.access_token;
+  a.accessExp = Date.now() + (Number(tok.expires_in) || 3600) * 1000;
+  if (tok.refresh_token) a.refreshToken = tok.refresh_token;
+  a.updatedAt = new Date().toISOString();
+  saveAgyState();
+  return a.accessToken;
+}
+
+async function agyUserInfoEmail(accessToken) {
+  const r = await fetch('https://www.googleapis.com/oauth2/v2/userinfo?alt=json', {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!r.ok) throw new Error(`读账号邮箱失败（${r.status}）`);
+  const d = await r.json();
+  return typeof d.email === 'string' ? d.email.trim().toLowerCase() : '';
+}
+
+// v1internal 调用：daily 主机优先，网络错误/5xx 时降级 prod 主机；
+// 4xx（含 429 额度）原样返回给调用方处理，不跨主机重试。
+async function agyApiFetch(accessToken, action, bodyObj, { stream = false, signal } = {}) {
+  let lastErr = null;
+  for (let i = 0; i < AGY_HOSTS.length; i++) {
+    const host = AGY_HOSTS[i];
+    try {
+      const r = await fetch(`${host}/v1internal:${action}${stream ? '?alt=sse' : ''}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'User-Agent': AGY_UA,
+        },
+        body: JSON.stringify(bodyObj || {}),
+        signal: signal || AbortSignal.timeout(stream ? 600000 : 120000),
+      });
+      if (r.status >= 500 && i < AGY_HOSTS.length - 1) {
+        try { await r.text(); } catch {}
+        continue;
+      }
+      return r;
+    } catch (e) {
+      if (signal && signal.aborted) throw e;
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('反重力上游不可达');
+}
+
+function agyProjectFromResponse(data) {
+  if (!data || typeof data !== 'object') return '';
+  const direct = data.cloudaicompanionProject;
+  if (typeof direct === 'string' && direct) return direct;
+  if (direct && typeof direct === 'object' && typeof direct.id === 'string') return direct.id;
+  if (data.response && typeof data.response === 'object') return agyProjectFromResponse(data.response);
+  return '';
+}
+
+async function agyLoadProject(email) {
+  const a = agyState.accounts[email];
+  const accessToken = await agyEnsureAccessToken(email);
+  const r = await agyApiFetch(accessToken, 'loadCodeAssist', { metadata: { ideType: 'ANTIGRAVITY' } });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`loadCodeAssist 失败（${r.status}）：${text.slice(0, 200)}`);
+  let data = null;
+  try { data = JSON.parse(text); } catch {}
+  if (!data) throw new Error('loadCodeAssist 响应解析失败');
+  const tierObj = (data.paidTier && (data.paidTier.name || data.paidTier.id)) ? data.paidTier
+    : (data.currentTier && (data.currentTier.name || data.currentTier.id)) ? data.currentTier : null;
+  if (tierObj) a.tier = String(tierObj.name || tierObj.id);
+  let project = agyProjectFromResponse(data);
+  if (!project) {
+    // 未开通过：用默认档位 onboard 一次
+    let tierId = 'free-tier';
+    if (Array.isArray(data.allowedTiers)) {
+      const def = data.allowedTiers.find((t) => t && t.isDefault && t.id);
+      if (def) tierId = String(def.id);
+    }
+    if (data.currentTier && data.currentTier.id) tierId = String(data.currentTier.id);
+    const ro = await agyApiFetch(accessToken, 'onboardUser', { tierId, metadata: { ideType: 'ANTIGRAVITY' } });
+    const text2 = await ro.text();
+    if (ro.ok) {
+      let data2 = null;
+      try { data2 = JSON.parse(text2); } catch {}
+      project = agyProjectFromResponse(data2);
+    }
+  }
+  if (project) a.projectId = project;
+  a.updatedAt = new Date().toISOString();
+  saveAgyState();
+  return { projectId: a.projectId || '', tier: a.tier || '' };
+}
+
+async function agyFetchModels(email) {
+  const a = agyState.accounts[email];
+  if (!a || !a.projectId) return [];
+  const accessToken = await agyEnsureAccessToken(email);
+  const r = await agyApiFetch(accessToken, 'fetchAvailableModels', { project: a.projectId });
+  if (!r.ok) {
+    try { await r.text(); } catch {}
+    return a.models || [];
+  }
+  const data = await r.json().catch(() => null);
+  const ids = data && data.models && typeof data.models === 'object' ? Object.keys(data.models) : [];
+  if (ids.length) {
+    a.models = ids;
+    a.updatedAt = new Date().toISOString();
+    saveAgyState();
+  }
+  return a.models || [];
+}
+
+// 管理台绑定：粘贴回调地址（或 code）→ 换 refresh_token；或直接粘
+// refresh_token 导入。换到令牌后立刻读邮箱、拉 project/档位/模型表。
+async function handleConsoleAgyBind(req, res, url) {
+  if (!requireConsoleAuth(req, res, url)) return;
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (e) {
+    return sendJson(res, e.httpStatus || 400, { error: { message: e.message, code: 'invalid_body' } });
+  }
+  try {
+    let refreshToken = typeof body.refreshToken === 'string' ? body.refreshToken.trim() : '';
+    let accessToken = '';
+    let accessExp = 0;
+    if (!refreshToken) {
+      let code = typeof body.code === 'string' ? body.code.trim() : '';
+      const cb = typeof body.callbackUrl === 'string' ? body.callbackUrl.trim() : '';
+      if (!code && cb) {
+        try { code = new URL(cb).searchParams.get('code') || ''; } catch {}
+        if (!code) {
+          const m = /[?&]code=([^&\s#]+)/.exec(cb);
+          if (m) { try { code = decodeURIComponent(m[1]); } catch { code = m[1]; } }
+        }
+      }
+      if (!code) {
+        return sendJson(res, 400, { error: { message: '没找到授权 code：请把浏览器地址栏里 localhost:51121 开头、带 code= 的完整地址整条粘进来', code: 'agy_code_missing' } });
+      }
+      const tok = await agyTokenRequest({
+        code,
+        client_id: AGY_CLIENT_ID,
+        client_secret: AGY_CLIENT_SECRET,
+        redirect_uri: AGY_REDIRECT_URI,
+        grant_type: 'authorization_code',
+      });
+      refreshToken = tok.refresh_token || '';
+      accessToken = tok.access_token || '';
+      accessExp = Date.now() + (Number(tok.expires_in) || 3600) * 1000;
+      if (!refreshToken) {
+        return sendJson(res, 400, { error: { message: '谷歌这次没给长期令牌（refresh_token）。多半是这个号以前授权过：去 myaccount.google.com/permissions 删掉 Antigravity 的授权，再重新绑定一次', code: 'agy_no_refresh_token' } });
+      }
+    }
+    if (!accessToken) {
+      const tok = await agyTokenRequest({
+        refresh_token: refreshToken,
+        client_id: AGY_CLIENT_ID,
+        client_secret: AGY_CLIENT_SECRET,
+        grant_type: 'refresh_token',
+      });
+      accessToken = tok.access_token;
+      accessExp = Date.now() + (Number(tok.expires_in) || 3600) * 1000;
+      if (tok.refresh_token) refreshToken = tok.refresh_token;
+    }
+    const email = await agyUserInfoEmail(accessToken);
+    if (!email) {
+      return sendJson(res, 502, { error: { message: '拿到了令牌但读不到账号邮箱，绑定中止', code: 'agy_no_email' } });
+    }
+    const prev = agyState.accounts[email];
+    agyState.accounts[email] = {
+      refreshToken,
+      accessToken,
+      accessExp,
+      projectId: (prev && prev.projectId) || '',
+      tier: (prev && prev.tier) || '',
+      enabled: true,
+      status: 'ok',
+      models: (prev && prev.models) || [],
+      cooldownUntil: 0,
+      boundAt: (prev && prev.boundAt) || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    saveAgyState();
+    let note = '';
+    try { await agyLoadProject(email); } catch (e) { note = `项目信息这次没拉到（${e.message}），生成时会自动重试`; }
+    try { await agyFetchModels(email); } catch {}
+    const a = agyState.accounts[email];
+    return sendJson(res, 200, {
+      ok: true,
+      email,
+      tier: a.tier || '',
+      projectId: a.projectId || '',
+      models: (a.models || []).length,
+      note,
+    });
+  } catch (e) {
+    return sendJson(res, e.status || 502, { error: { message: `绑定失败：${e.message}`, code: 'agy_bind_failed' } });
+  }
+}
+
+// OpenAI messages → Gemini 原生 inner request（v1internal 的 request 字段）
+function agyPartsOf(content) {
+  if (typeof content === 'string') return content ? [{ text: content }] : [];
+  if (!Array.isArray(content)) return [];
+  const parts = [];
+  for (const p of content) {
+    if (!p || typeof p !== 'object') continue;
+    if (p.type === 'text' && p.text) parts.push({ text: String(p.text) });
+    else if (p.type === 'image_url' && p.image_url && typeof p.image_url.url === 'string') {
+      const m = /^data:([^;,]+);base64,([\s\S]+)$/.exec(p.image_url.url);
+      if (m) parts.push({ inlineData: { mimeType: m[1], data: m[2] } });
+    }
+  }
+  return parts;
+}
+
+function agyBuildInnerRequest(body) {
+  const sysParts = [];
+  const contents = [];
+  const pushContent = (role, parts) => {
+    if (!parts.length) return;
+    const last = contents[contents.length - 1];
+    if (last && last.role === role) last.parts.push(...parts);
+    else contents.push({ role, parts });
+  };
+  for (const msg of Array.isArray(body.messages) ? body.messages : []) {
+    if (!msg || typeof msg !== 'object') continue;
+    const role = String(msg.role || '');
+    if (role === 'system' || role === 'developer') {
+      for (const p of agyPartsOf(msg.content)) if (p.text) sysParts.push({ text: p.text });
+      continue;
+    }
+    if (role === 'tool' || role === 'function') {
+      let resp = msg.content;
+      if (typeof resp === 'string') { try { resp = JSON.parse(resp); } catch {} }
+      pushContent('user', [{
+        functionResponse: {
+          name: String(msg.name || 'tool'),
+          response: resp && typeof resp === 'object' ? resp : { result: resp == null ? '' : resp },
+        },
+      }]);
+      continue;
+    }
+    const parts = agyPartsOf(msg.content);
+    if (Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        if (!tc || !tc.function) continue;
+        let args = {};
+        try { args = JSON.parse(tc.function.arguments || '{}'); } catch {}
+        parts.push({ functionCall: { name: String(tc.function.name || ''), args } });
+      }
+    }
+    pushContent(role === 'assistant' ? 'model' : 'user', parts);
+  }
+  const inner = { contents: contents.length ? contents : [{ role: 'user', parts: [{ text: '' }] }] };
+  if (sysParts.length) inner.systemInstruction = { parts: sysParts };
+  const gc = {};
+  if (body.temperature != null) gc.temperature = body.temperature;
+  if (body.top_p != null) gc.topP = body.top_p;
+  if (body.top_k != null) gc.topK = body.top_k;
+  const maxTok = body.max_tokens ?? body.max_completion_tokens;
+  if (maxTok != null) gc.maxOutputTokens = maxTok;
+  if (Array.isArray(body.stop) && body.stop.length) gc.stopSequences = body.stop;
+  if (body.thinking_config || body.thinkingConfig) gc.thinkingConfig = body.thinking_config || body.thinkingConfig;
+  inner.generationConfig = gc;
+  if (Array.isArray(body.tools) && body.tools.length) {
+    const decls = body.tools
+      .filter((t) => t && t.type === 'function' && t.function && t.function.name)
+      .map((t) => ({ name: String(t.function.name), description: String(t.function.description || ''), parameters: t.function.parameters || {} }));
+    if (decls.length) inner.tools = [{ functionDeclarations: decls }];
+  }
+  try {
+    inner.sessionId = crypto.createHash('sha256').update(JSON.stringify((body.messages || []).slice(0, 2))).digest('hex').slice(0, 32);
+  } catch {}
+  return inner;
+}
+
+let agyRrCursor = 0;
+function agyPickAccounts() {
+  const now = Date.now();
+  const list = Object.entries(agyState.accounts)
+    .filter(([, a]) => a && a.enabled !== false && a.refreshToken && a.projectId && a.status !== 'dead' && !(a.cooldownUntil > now))
+    .map(([email, a]) => ({ email, a }));
+  if (!list.length) return [];
+  const start = agyRrCursor % list.length;
+  agyRrCursor += 1;
+  return list.slice(start).concat(list.slice(0, start));
+}
+
+function agyUnwrap(json) {
+  return json && typeof json === 'object' && json.response && typeof json.response === 'object' ? json.response : json;
+}
+
+function agyFinishReason(fr) {
+  switch (String(fr || '')) {
+    case 'MAX_TOKENS': return 'length';
+    case 'SAFETY': case 'PROHIBITED_CONTENT': case 'BLOCKLIST': return 'content_filter';
+    default: return 'stop';
+  }
+}
+
+function agyCandidateParts(candidate) {
+  const out = { text: '', thought: '', toolCalls: [] };
+  const parts = candidate && candidate.content && Array.isArray(candidate.content.parts) ? candidate.content.parts : [];
+  for (const p of parts) {
+    if (!p || typeof p !== 'object') continue;
+    if (typeof p.text === 'string') {
+      if (p.thought) out.thought += p.text;
+      else out.text += p.text;
+    } else if (p.functionCall && typeof p.functionCall === 'object') {
+      out.toolCalls.push(p.functionCall);
+    }
+  }
+  return out;
+}
+
+async function handleAgyChat(req, res, body) {
+  const stream = !!body.stream;
+  const rec = makeUsageRecorder(body.model, stream);
+  const model = String(body.model || '').trim().replace(/^models\//, '').slice(4) || 'gemini-3-flash';
+  const candidates = agyPickAccounts();
+  if (!candidates.length) {
+    const anyAccount = Object.keys(agyState.accounts).length > 0;
+    const msg = anyAccount
+      ? '反重力账号都在冷却/被禁用/未就绪，稍后再试'
+      : '反重力通道还没有绑定账号：先到管理台「反重力」板块绑定一个小号';
+    rec(false, 503, msg);
+    return openAiError(res, 503, msg, 'agy_no_account');
+  }
+  const inner = agyBuildInnerRequest(body);
+  const completionId = `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
+  const created = Math.floor(Date.now() / 1000);
+  let lastStatus = 502;
+  let lastMsg = '反重力上游无响应';
+
+  for (const { email, a } of candidates) {
+    let accessToken;
+    try {
+      accessToken = await agyEnsureAccessToken(email);
+    } catch (e) {
+      lastStatus = e.status || 502;
+      lastMsg = `账号令牌刷新失败：${e.message}`;
+      if (e.googleError === 'invalid_grant') {
+        a.status = 'dead';
+        a.updatedAt = new Date().toISOString();
+        saveAgyState();
+      }
+      continue;
+    }
+    const envelope = {
+      project: a.projectId,
+      requestId: `agy-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+      model,
+      userAgent: 'antigravity',
+      requestType: model.includes('image') ? 'image_gen' : 'agent',
+      request: inner,
+    };
+    const ac = new AbortController();
+    let clientGone = false;
+    res.on('close', () => { clientGone = true; try { ac.abort(); } catch {} });
+    let upstream;
+    try {
+      upstream = await agyApiFetch(accessToken, stream ? 'streamGenerateContent' : 'generateContent', envelope, { stream, signal: ac.signal });
+    } catch (e) {
+      if (clientGone) { rec(false, 499, 'client_disconnected'); return; }
+      lastStatus = 502;
+      lastMsg = `连接反重力上游失败：${e.message}`;
+      continue;
+    }
+    if (upstream.status === 429) {
+      a.cooldownUntil = Date.now() + 60000;
+      a.updatedAt = new Date().toISOString();
+      saveAgyState();
+      lastStatus = 429;
+      lastMsg = '反重力额度不足（429），已冷却该账号并尝试下一个';
+      try { await upstream.text(); } catch {}
+      continue;
+    }
+    if (!upstream.ok) {
+      const t = await upstream.text().catch(() => '');
+      lastStatus = upstream.status;
+      lastMsg = `反重力上游错误 ${upstream.status}：${t.slice(0, 200)}`;
+      continue;
+    }
+
+    if (!stream) {
+      try {
+        const raw = await upstream.json();
+        const resp = agyUnwrap(raw);
+        const cand = resp && Array.isArray(resp.candidates) ? resp.candidates[0] : null;
+        const got = agyCandidateParts(cand);
+        const message = { role: 'assistant', content: got.text };
+        if (got.thought) message.reasoning_content = got.thought;
+        let finish = agyFinishReason(cand && cand.finishReason);
+        if (got.toolCalls.length) {
+          message.tool_calls = got.toolCalls.map((fc, i) => ({
+            index: i,
+            id: `call_${crypto.randomBytes(6).toString('hex')}`,
+            type: 'function',
+            function: { name: String(fc.name || ''), arguments: JSON.stringify(fc.args || {}) },
+          }));
+          if (finish === 'stop') finish = 'tool_calls';
+          message.content = got.text || null;
+        }
+        const um = (resp && resp.usageMetadata) || {};
+        rec(true, 200, '');
+        try {
+          sendJson(res, 200, {
+            id: completionId,
+            object: 'chat.completion',
+            created,
+            model: `agy-${model}`,
+            choices: [{ index: 0, message, finish_reason: finish }],
+            usage: {
+              prompt_tokens: Number(um.promptTokenCount) || 0,
+              completion_tokens: Number(um.candidatesTokenCount) || 0,
+              total_tokens: Number(um.totalTokenCount) || 0,
+            },
+          });
+        } catch {}
+        return;
+      } catch (e) {
+        if (clientGone) { rec(false, 499, 'client_disconnected'); return; }
+        lastStatus = 502;
+        lastMsg = `反重力响应解析失败：${e.message}`;
+        continue;
+      }
+    }
+
+    // 流式：逐行读 SSE，unwrap .response 后转 OpenAI chunk
+    let headersSent = false;
+    let finished = false;
+    const ensureHeaders = () => {
+      if (headersSent) return;
+      headersSent = true;
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+        'Access-Control-Allow-Origin': '*',
+      });
+    };
+    const writeChunk = (delta, finishReason, usage) => {
+      ensureHeaders();
+      const chunk = {
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created,
+        model: `agy-${model}`,
+        choices: [{ index: 0, delta, finish_reason: finishReason ?? null }],
+      };
+      if (usage) chunk.usage = usage;
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    };
+    try {
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      let finishReason = null;
+      let usage = null;
+      let toolIdx = 0;
+      const handleDataLine = (line) => {
+        if (!line.startsWith('data:')) return;
+        const data = line.slice(5).trim();
+        if (!data || data === '[DONE]') return;
+        let json = null;
+        try { json = JSON.parse(data); } catch { return; }
+        const resp = agyUnwrap(json);
+        const cand = resp && Array.isArray(resp.candidates) ? resp.candidates[0] : null;
+        if (cand) {
+          const got = agyCandidateParts(cand);
+          const delta = {};
+          if (got.thought) delta.reasoning_content = got.thought;
+          if (got.text) delta.content = got.text;
+          if (got.toolCalls.length) {
+            delta.tool_calls = got.toolCalls.map((fc) => ({
+              index: toolIdx++,
+              id: `call_${crypto.randomBytes(6).toString('hex')}`,
+              type: 'function',
+              function: { name: String(fc.name || ''), arguments: JSON.stringify(fc.args || {}) },
+            }));
+          }
+          if (delta.content || delta.reasoning_content || delta.tool_calls) {
+            rec.markTtfb();
+            writeChunk(delta, null);
+          }
+          if (cand.finishReason) finishReason = agyFinishReason(cand.finishReason);
+        }
+        if (resp && resp.usageMetadata) {
+          const um = resp.usageMetadata;
+          usage = {
+            prompt_tokens: Number(um.promptTokenCount) || 0,
+            completion_tokens: Number(um.candidatesTokenCount) || 0,
+            total_tokens: Number(um.totalTokenCount) || 0,
+          };
+        }
+      };
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (line) handleDataLine(line);
+        }
+      }
+      if (buf.trim()) handleDataLine(buf.trim());
+      finished = true;
+      rec(true, 200, '');
+      writeChunk({}, finishReason || 'stop', usage);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    } catch (e) {
+      if (clientGone || finished) { rec(false, 499, 'client_disconnected'); return; }
+      lastStatus = 502;
+      lastMsg = `反重力流式中断：${e.message}`;
+      if (headersSent) {
+        rec(false, 502, lastMsg);
+        try {
+          res.write(`data: ${JSON.stringify({ error: { message: lastMsg, type: 'relay_error', code: 'agy_stream_error' } })}\n\n`);
+          res.end();
+        } catch {}
+        return;
+      }
+      continue;
+    }
+  }
+  rec(false, lastStatus, lastMsg);
+  return openAiError(res, lastStatus, lastMsg, 'agy_upstream_error');
+}
+
 // gpsoauth 兑换：POST android.clients.google.com/auth（表单编码），参数
 // 逐字对齐开源 gpsoauth 的 build_exchange_token_data。TLS 按其要求处理：
 // 不发 ALPN、保留会话票据、指定密码套件——Google 对这三点挑剔，不对会回
@@ -271,7 +916,7 @@ function recordUsage(rec) {
     fs.appendFileSync(USAGE_PATH, JSON.stringify({
       ts: Date.now(),
       model: String(rec.model || ''),
-      channel: rec.channel === 'pggo' ? 'pggo' : 'pg',
+      channel: rec.channel === 'pggo' || rec.channel === 'agy' ? rec.channel : 'pg',
       ok: !!rec.ok,
       status: Number(rec.status) || 0,
       error: rec.ok ? '' : String(rec.error || '').slice(0, 200),
@@ -289,7 +934,7 @@ function makeUsageRecorder(modelRaw, stream) {
   let recorded = false;
   let ttfbMs = null;
   const t0 = Date.now();
-  const channel = isPggoModel(modelRaw) ? 'pggo' : 'pg';
+  const channel = isPggoModel(modelRaw) ? 'pggo' : isAgyModel(modelRaw) ? 'agy' : 'pg';
   const model = String(modelRaw || '');
   const rec = (ok, status, error) => {
     if (recorded) return;
@@ -375,7 +1020,7 @@ function usageSummary(dayParam) {
     .map((r) => ({
       ts: Number(r.ts),
       model: String(r.model || ''),
-      channel: r.channel === 'pggo' ? 'pggo' : 'pg',
+      channel: r.channel === 'pggo' || r.channel === 'agy' ? r.channel : 'pg',
       ok: !!r.ok,
       status: Number(r.status) || 0,
       error: String(r.error || ''),
@@ -2178,6 +2823,9 @@ async function handleChatCompletions(req, res, url) {
   } catch (e) {
     return openAiError(res, e.httpStatus || 400, e.message, 'invalid_body');
   }
+  if (isAgyModel(body.model)) {
+    return await handleAgyChat(req, res, body);
+  }
   if (isPggoModel(body.model)) {
     return await handlePggoChat(req, res, body);
   }
@@ -3156,6 +3804,63 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, removed: existed });
     }
 
+    if (req.method === 'GET' && pathname === '/api/console/agy') {
+      if (!requireConsoleAuth(req, res, url)) return;
+      const accounts = Object.entries(agyState.accounts)
+        .map(([email, a]) => ({
+          email,
+          tier: a.tier || '',
+          projectId: a.projectId || '',
+          enabled: a.enabled !== false,
+          status: a.status || 'ok',
+          models: Array.isArray(a.models) ? a.models.length : 0,
+          boundAt: a.boundAt || null,
+          updatedAt: a.updatedAt || null,
+        }))
+        .sort((x, y) => x.email.localeCompare(y.email));
+      return sendJson(res, 200, { ok: true, authUrl: agyAuthUrl(), accounts });
+    }
+
+    if (req.method === 'POST' && pathname === '/api/console/agy/bind') {
+      return await handleConsoleAgyBind(req, res, url);
+    }
+
+    if (req.method === 'POST' && pathname === '/api/console/agy/delete') {
+      if (!requireConsoleAuth(req, res, url)) return;
+      let delBody;
+      try {
+        delBody = await readJsonBody(req);
+      } catch (e) {
+        return sendJson(res, e.httpStatus || 400, { error: { message: e.message, code: 'invalid_body' } });
+      }
+      const delEmail = typeof delBody.email === 'string' ? delBody.email.trim().toLowerCase() : '';
+      const existed = Boolean(agyState.accounts[delEmail]);
+      if (existed) {
+        delete agyState.accounts[delEmail];
+        saveAgyState();
+      }
+      return sendJson(res, 200, { ok: true, removed: existed });
+    }
+
+    if (req.method === 'POST' && pathname === '/api/console/agy/toggle') {
+      if (!requireConsoleAuth(req, res, url)) return;
+      let tgBody;
+      try {
+        tgBody = await readJsonBody(req);
+      } catch (e) {
+        return sendJson(res, e.httpStatus || 400, { error: { message: e.message, code: 'invalid_body' } });
+      }
+      const tgEmail = typeof tgBody.email === 'string' ? tgBody.email.trim().toLowerCase() : '';
+      const acct = agyState.accounts[tgEmail];
+      if (!acct) {
+        return sendJson(res, 404, { error: { message: '账号不存在', code: 'agy_not_found' } });
+      }
+      acct.enabled = !!tgBody.enabled;
+      acct.updatedAt = new Date().toISOString();
+      saveAgyState();
+      return sendJson(res, 200, { ok: true, email: tgEmail, enabled: acct.enabled });
+    }
+
     if (req.method === 'GET' && pathname === '/api/console/pool') {
       if (!requireConsoleAuth(req, res, url)) return;
       return sendJson(res, 200, {
@@ -3291,6 +3996,16 @@ const server = http.createServer(async (req, res) => {
           if (!seen.has(pid)) {
             seen.add(pid);
             data.push({ id: pid, object: 'model', created: 0, owned_by: 'google-aistudio-headless' });
+          }
+        }
+      }
+      {
+        const have = new Set(data.map((m) => m.id));
+        for (const id of agyModelIds()) {
+          const aid = `agy-${id}`;
+          if (!have.has(aid)) {
+            have.add(aid);
+            data.push({ id: aid, object: 'model', created: 0, owned_by: 'google-antigravity' });
           }
         }
       }

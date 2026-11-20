@@ -82,6 +82,7 @@
   <button type="button" data-show="pool">流量池</button>
   <button type="button" data-show="usage">用量日志</button>
   <button type="button" data-show="robin">Robin</button>
+  <button type="button" data-show="agy">反重力</button>
   <button type="button" data-show="settings">设置</button>
 </nav>
 
@@ -205,6 +206,31 @@
 <div class="card" data-tab="robin">
   <h2>已绑定 Robin 账号</h2>
   <div id="robinList"><p class="hint">加载中…</p></div>
+</div>
+
+<div class="card" data-tab="agy">
+  <h2>反重力通道（Antigravity）</h2>
+  <p class="hint">第三条凭证线：谷歌 Antigravity 的 OAuth 凭证，模型名用 <span class="mono">agy-</span> 前缀（如 <span class="mono">agy-gemini-3-pro-high</span>、<span class="mono">agy-claude-sonnet-4-5-thinking</span>）。跟 pggo 的 Cookie、Robin 的主令牌<b>分开存、分开用，绝不混池</b>。凭证是长期 refresh_token，<b>只许绑小号，不要绑你养着的主力号</b>。</p>
+  <p>
+    <button type="button" id="agyAuthBtn">打开授权页</button>
+  </p>
+  <p class="hint">绑定步骤：① 点上面按钮打开谷歌授权页，用<b>小号</b>登录并同意授权；② 授权完浏览器会跳到一个<b>打不开的 localhost:51121 页面</b>——这是正常现象，不用管它能不能打开，把<b>地址栏里那一整条地址</b>复制下来；③ 粘到下面框里，点「完成绑定」。</p>
+  <textarea id="agyCallback" rows="3" placeholder="把回调地址整条粘到这里（localhost:51121 开头、带 code= 的那条）"></textarea>
+  <p>
+    <button type="button" id="agyBindBtn">完成绑定</button>
+    <span class="hint" id="agyBindMsg"></span>
+  </p>
+  <p class="hint">或者已经有 refresh_token（从别处导出的）可以直接粘进来导入，效果一样：</p>
+  <textarea id="agyRt" rows="2" placeholder="粘贴 refresh_token（1// 开头那串）"></textarea>
+  <p>
+    <button type="button" id="agyRtBtn" class="secondary">导入 refresh_token</button>
+    <span class="hint" id="agyRtMsg"></span>
+  </p>
+</div>
+
+<div class="card" data-tab="agy">
+  <h2>已绑定反重力账号</h2>
+  <div id="agyList"><p class="hint">加载中…</p></div>
 </div>
 
 <script>
@@ -693,7 +719,7 @@ function renderUsage(d) {
     : '<p class="hint">这一天还没有生成请求。</p>';
   $('usageEntries').innerHTML = (d.entries && d.entries.length)
     ? d.entries.map((e) => {
-        const chanPill = `<span class="upill ch">${e.channel === 'pggo' ? '云端' : '挂机'}</span>`;
+        const chanPill = `<span class="upill ch">${e.channel === 'pggo' ? '云端' : e.channel === 'agy' ? '反重力' : '挂机'}</span>`;
         const statusPill = e.ok
           ? `<span class="upill ok">成功 ${e.status || ''}</span>`
           : `<span class="upill fail">失败 ${e.status || ''}</span>`;
@@ -789,6 +815,139 @@ async function deleteRobin(email) {
 }
 
 // ---------------------------------------------------------------------------
+// 反重力板块：OAuth 授权绑定（粘回调地址换 refresh_token）/ RT 直填导入
+// + 已绑定账号列表（只显示邮箱/档位/project/模型数，令牌本体永不下发到
+// 页面）+ 启用/禁用/删除。凭证与 pggo、Robin 分池存放，互不串用。
+// ---------------------------------------------------------------------------
+let agyAuthUrlCache = '';
+async function loadAgy() {
+  const box = $('agyList');
+  if (!box) return;
+  try {
+    const r = await fetch('/api/console/agy', {
+      headers: { 'X-API-Key': keyInput.value.trim() },
+      credentials: 'same-origin',
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + r.status));
+    agyAuthUrlCache = data.authUrl || '';
+    const list = data.accounts || [];
+    if (!list.length) {
+      box.innerHTML = '<p class="hint">还没有绑定任何反重力账号。按上面步骤授权一次，这里就会出现。</p>';
+      return;
+    }
+    box.innerHTML = '';
+    for (const a of list) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const name = document.createElement('span');
+      name.textContent = a.email;
+      const meta = document.createElement('span');
+      meta.className = 'hint';
+      meta.textContent = [
+        a.tier || '未知档位',
+        a.projectId ? '项目 ' + a.projectId : '无项目',
+        '模型 ' + (a.models || 0),
+        a.status === 'dead' ? '令牌已失效，需重新绑定' : (a.enabled ? '启用中' : '已禁用'),
+      ].join(' · ');
+      const tg = document.createElement('button');
+      tg.type = 'button';
+      tg.className = 'secondary';
+      tg.textContent = a.enabled ? '禁用' : '启用';
+      tg.onclick = () => agyToggle(a.email, !a.enabled);
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'secondary';
+      del.textContent = '删除';
+      del.onclick = () => agyDelete(a.email);
+      row.appendChild(name);
+      row.appendChild(meta);
+      row.appendChild(tg);
+      row.appendChild(del);
+      box.appendChild(row);
+    }
+  } catch (e) {
+    box.innerHTML = '';
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = '加载失败：' + e.message;
+    box.appendChild(p);
+  }
+}
+async function agyPost(path, payload) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': keyInput.value.trim() },
+    credentials: 'same-origin',
+    body: JSON.stringify(payload),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + r.status));
+  return data;
+}
+async function agyToggle(email, enabled) {
+  try {
+    await agyPost('/api/console/agy/toggle', { email, enabled });
+    loadAgy();
+  } catch (e) {
+    alert('操作失败：' + e.message);
+  }
+}
+async function agyDelete(email) {
+  if (!confirm('删除这个反重力账号的凭证？删后要重新授权才能再用。\n\n' + email)) return;
+  try {
+    await agyPost('/api/console/agy/delete', { email });
+    loadAgy();
+  } catch (e) {
+    alert('删除失败：' + e.message);
+  }
+}
+{
+  const authBtn = $('agyAuthBtn');
+  if (authBtn) {
+    authBtn.onclick = async () => {
+      if (!agyAuthUrlCache) await loadAgy();
+      if (agyAuthUrlCache) window.open(agyAuthUrlCache, '_blank');
+      else alert('授权链接还没生成出来，切到本页等列表加载完再点一次');
+    };
+  }
+  const bindBtn = $('agyBindBtn');
+  if (bindBtn) {
+    bindBtn.onclick = async () => {
+      const msg = $('agyBindMsg');
+      const cb = $('agyCallback').value.trim();
+      if (!cb) { msg.textContent = '先把回调地址粘进来'; return; }
+      msg.textContent = '绑定中…（要换令牌、拉项目信息，慢几秒正常）';
+      try {
+        const d = await agyPost('/api/console/agy/bind', { callbackUrl: cb });
+        msg.textContent = '绑定成功：' + d.email + (d.tier ? ' · ' + d.tier : '') + ' · 模型 ' + (d.models || 0) + ' 个' + (d.note ? '（' + d.note + '）' : '');
+        $('agyCallback').value = '';
+        loadAgy();
+      } catch (e) {
+        msg.textContent = '绑定失败：' + e.message;
+      }
+    };
+  }
+  const rtBtn = $('agyRtBtn');
+  if (rtBtn) {
+    rtBtn.onclick = async () => {
+      const msg = $('agyRtMsg');
+      const rt = $('agyRt').value.trim();
+      if (!rt) { msg.textContent = '先把 refresh_token 粘进来'; return; }
+      msg.textContent = '导入中…';
+      try {
+        const d = await agyPost('/api/console/agy/bind', { refreshToken: rt });
+        msg.textContent = '导入成功：' + d.email + (d.tier ? ' · ' + d.tier : '') + ' · 模型 ' + (d.models || 0) + ' 个' + (d.note ? '（' + d.note + '）' : '');
+        $('agyRt').value = '';
+        loadAgy();
+      } catch (e) {
+        msg.textContent = '导入失败：' + e.message;
+      }
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 标签页切换：卡片按 data-tab 分组（总览/流量池/用量日志/设置），纯前端
 // 显示/隐藏，不新增后端接口；刷新页面默认回总览。
 // ---------------------------------------------------------------------------
@@ -801,6 +960,7 @@ function showTab(name) {
   });
   if (name === 'usage') loadUsage();
   if (name === 'robin') loadRobin();
+  if (name === 'agy') loadAgy();
 }
 document.querySelectorAll('#tabbar button').forEach((b) => {
   b.onclick = () => showTab(b.dataset.show);
