@@ -921,6 +921,16 @@ function usageWindowRange(dayStr, hour) {
   return { start, end: start + 24 * 3600 * 1000 };
 }
 
+// 分日窗口解析（用量汇总与按账号查询共用）：hour 缺省/非法 → 0；day 缺省/
+// 格式不对 → 当前窗口。
+function resolveUsageWindow(dayParam, hourParam) {
+  const hourNum = Number(hourParam);
+  const hour = Number.isInteger(hourNum) && hourNum >= 0 && hourNum <= 23 ? hourNum : 0;
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(dayParam || '') ? dayParam : usageWindowKey(Date.now(), hour);
+  const range = usageWindowRange(day, hour);
+  return { day, hour, start: range.start, end: range.end };
+}
+
 function recordUsage(rec) {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -999,10 +1009,9 @@ setInterval(pruneUsageLog, 6 * 3600 * 1000).unref();
 // entries 为当天全部流水（最新在前，最多 300 条），供管理台逐条看时间明细。
 function usageSummary(dayParam, hourParam) {
   const records = readUsageRecords();
-  const hourNum = Number(hourParam);
-  const hour = Number.isInteger(hourNum) && hourNum >= 0 && hourNum <= 23 ? hourNum : 0;
+  const win = resolveUsageWindow(dayParam, hourParam);
+  const { day, hour } = win;
   const days = [...new Set(records.map((r) => usageWindowKey(Number(r.ts), hour)))].sort().reverse();
-  const day = /^\d{4}-\d{2}-\d{2}$/.test(dayParam || '') ? dayParam : usageWindowKey(Date.now(), hour);
   const todays = records.filter((r) => usageWindowKey(Number(r.ts), hour) === day);
   const byModelMap = new Map();
   let ok = 0;
@@ -1042,8 +1051,79 @@ function usageSummary(dayParam, hourParam) {
       durMs: numOrNull(r.durMs),
       ttfbMs: numOrNull(r.ttfbMs),
     }));
-  const range = usageWindowRange(day, hour);
-  return { day, days, hour, windowStart: range.start, windowEnd: range.end, total: todays.length, ok, fail: todays.length - ok, byModel, errors, entries };
+  return { day, days, hour, windowStart: win.start, windowEnd: win.end, total: todays.length, ok, fail: todays.length - ok, byModel, errors, entries };
+}
+
+// ---------------------------------------------------------------------------
+// 按账号用量：咱们自己的 usage.jsonl 没记账号（请求交给无头池调度，谁出
+// 的中继不知道），但无头服务（AIStudio2API）自己的请求账本每条都记了
+// 账号，还提供按账号汇总（GET /api/usage?stack=account）与按账号筛流水
+// （GET /api/usage/records?account=）。这里只做窗口换算与字段归一，账本
+// 不可达时抛错、由路由层转 502，不影响用量页其余部分。
+// ---------------------------------------------------------------------------
+async function hlUsageByAccount(win) {
+  const qs = new URLSearchParams({
+    from: new Date(win.start).toISOString(),
+    to: new Date(win.end).toISOString(),
+    stack: 'account',
+    tz: 'Asia/Shanghai',
+  });
+  const r = await hlAdmin(`/api/usage?${qs.toString()}`);
+  if (!r.ok) throw new Error(`无头账本返回 HTTP ${r.status}`);
+  const rep = await r.json().catch(() => null);
+  const groups = rep && rep.groups && Array.isArray(rep.groups.account) ? rep.groups.account : [];
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  return groups
+    .map((g) => ({
+      account: String(g.key || ''),
+      requests: num(g.requests),
+      succeeded: num(g.succeeded),
+      failed: num(g.failed),
+      canceled: num(g.canceled),
+      rateLimited: num(g.rate_limited),
+      inputTokens: num(g.input_tokens),
+      cachedTokens: num(g.cached_tokens),
+      reasoningTokens: num(g.reasoning_tokens),
+      replyTokens: num(g.reply_tokens),
+      totalTokens: num(g.total_tokens),
+    }))
+    .filter((a) => a.account)
+    .sort((a, b) => b.requests - a.requests);
+}
+
+async function hlUsageAccountRecords(win, account, cursor) {
+  const qs = new URLSearchParams({
+    from: new Date(win.start).toISOString(),
+    to: new Date(win.end).toISOString(),
+    account,
+    limit: '100',
+  });
+  if (cursor) qs.set('cursor', cursor);
+  const r = await hlAdmin(`/api/usage/records?${qs.toString()}`);
+  if (!r.ok) throw new Error(`无头账本返回 HTTP ${r.status}`);
+  const page = await r.json().catch(() => null);
+  const items = page && Array.isArray(page.items) ? page.items : [];
+  const numOrNull = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+  return {
+    entries: items.map((it) => {
+      const status = numOrNull(it.status) || 0;
+      return {
+        ts: Date.parse(it.time) || 0,
+        model: String(it.model || ''),
+        status,
+        state: String(it.state || ''),
+        ok: status >= 200 && status < 300,
+        durMs: numOrNull(it.duration_ms),
+        ttfbMs: numOrNull(it.first_event_ms),
+        inputTokens: numOrNull(it.input_tokens),
+        cachedTokens: numOrNull(it.cached_tokens),
+        replyTokens: numOrNull(it.reply_tokens),
+        totalTokens: numOrNull(it.total_tokens),
+        error: String(it.error || ''),
+      };
+    }),
+    nextCursor: page && page.next_cursor ? String(page.next_cursor) : '',
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -3708,6 +3788,30 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && pathname === '/api/console/usage') {
       if (!requireConsoleAuth(req, res, url)) return;
       return sendJson(res, 200, { ok: true, ...usageSummary(url.searchParams.get('day') || '', url.searchParams.get('hour') || '') });
+    }
+
+    if (req.method === 'GET' && pathname === '/api/console/usage/accounts') {
+      if (!requireConsoleAuth(req, res, url)) return;
+      const win = resolveUsageWindow(url.searchParams.get('day') || '', url.searchParams.get('hour') || '');
+      try {
+        const accounts = await hlUsageByAccount(win);
+        return sendJson(res, 200, { ok: true, day: win.day, hour: win.hour, windowStart: win.start, windowEnd: win.end, accounts });
+      } catch (e) {
+        return sendJson(res, 502, { error: { message: '按账号用量取不到：' + e.message, code: 'hl_usage_failed' } });
+      }
+    }
+
+    if (req.method === 'GET' && pathname === '/api/console/usage/account-records') {
+      if (!requireConsoleAuth(req, res, url)) return;
+      const account = String(url.searchParams.get('account') || '').trim();
+      if (!account) return sendJson(res, 400, { error: { message: '缺 account 参数', code: 'account_required' } });
+      const win = resolveUsageWindow(url.searchParams.get('day') || '', url.searchParams.get('hour') || '');
+      try {
+        const out = await hlUsageAccountRecords(win, account, String(url.searchParams.get('cursor') || ''));
+        return sendJson(res, 200, { ok: true, day: win.day, hour: win.hour, windowStart: win.start, windowEnd: win.end, account, ...out });
+      } catch (e) {
+        return sendJson(res, 502, { error: { message: '按账号流水取不到：' + e.message, code: 'hl_usage_failed' } });
+      }
     }
 
     if (req.method === 'GET' && pathname === '/api/console/pggo') {

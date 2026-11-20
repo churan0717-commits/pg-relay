@@ -40,6 +40,24 @@
   #subNodeMsg { min-height: 20px; font-size: 14px; margin: 8px 0 0; }
   #usageMsg { min-height: 20px; font-size: 14px; margin: 8px 0 0; }
   .uhour.on { background: linear-gradient(135deg, #ff9e7a, #ff7e5f); color: #fff; border-color: #ff8a66; box-shadow: 0 3px 10px rgba(255,126,95,.25); }
+  .uhrow { display: flex; gap: 8px; flex-wrap: nowrap; align-items: center; margin-top: 8px; }
+  .uhrow .uhour { flex: 1 1 0; padding: 9px 6px; white-space: nowrap; }
+  .ustat.total b { color: #D94F26; }
+  /* 按账号卡片 */
+  .uacct { background: #fffdf9; border: 1.5px solid #f3ddc8; border-radius: 14px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; }
+  .uacct.on { border-color: #ff8a66; box-shadow: 0 3px 10px rgba(255,126,95,.18); }
+  .uacct .ua-top { display: flex; align-items: flex-start; gap: 8px; }
+  .uacct .ua-mail { font-weight: 700; color: #5b3a29; overflow-wrap: anywhere; padding-top: 4px; }
+  .uacct .ua-total { margin-left: auto; text-align: right; flex: 0 0 auto; }
+  .uacct .ua-total b { font-size: 22px; line-height: 1.1; color: #5b3a29; }
+  .uacct .ua-total span { display: block; font-size: 11px; opacity: .7; }
+  .uacct .ua-nums { font-size: 13px; margin-top: 4px; }
+  .uacct .ua-nums .okn { color: #27ae60; font-weight: 700; }
+  .uacct .ua-nums .failn { color: #e74c3c; font-weight: 700; }
+  .uacct .ua-bar { display: block; height: 7px; border-radius: 99px; background: #f6e3cd; margin-top: 8px; overflow: hidden; }
+  .uacct .ua-bar i { display: block; height: 100%; border-radius: 99px; background: linear-gradient(90deg, #ff9e7a, #ff7e5f); }
+  .uacct .ua-cap { font-size: 11px; opacity: .7; margin-top: 4px; }
+  .uacct .ua-tok { font-size: 12px; opacity: .85; margin-top: 4px; }
   .wrapany { overflow-wrap: anywhere; }
   .num { white-space: nowrap; }
   .uentry { padding: 7px 0; border-bottom: 1px solid #f6e3cd; }
@@ -188,14 +206,23 @@
     <select id="usageDay"></select>
     <button class="secondary" id="usageRefresh">刷新用量</button>
   </div>
-  <div class="row" style="margin-top:8px">
+  <div class="uhrow">
     <span class="hint">分日点：</span>
     <button type="button" class="secondary uhour" data-hour="0">0 点 · 中国日</button>
     <button type="button" class="secondary uhour" data-hour="15">15 点 · 美国日</button>
-    <span class="hint" id="usageWindow"></span>
   </div>
+  <p class="hint" id="usageWindow" style="margin:6px 0 0"></p>
   <div id="usageSummary"></div>
   <div id="usageModels"></div>
+  <div style="margin-top:12px">
+    <p class="hint" style="margin-bottom:6px"><b style="color:#5b3a29">按账号</b>（只统计云端 pggo，数据来自无头服务的账本）：每个账号在这个窗口里各用了多少，一眼分清。在框里选一个账号，下面的流水就只看它的；点账号卡也能切换，再点一次恢复全部。</p>
+    <div class="row">
+      <span class="hint">查看账号：</span>
+      <select id="usageAcctSel"><option value="">全部账号</option></select>
+    </div>
+    <div id="usageAccounts" style="margin-top:8px"></div>
+    <p id="usageAcctMsg" class="hint"></p>
+  </div>
   <p class="hint" style="margin-top:10px">流水明细（几点几分用了什么，最新在前，最多 300 条；失败原因直接写在卡片里）：</p>
   <div id="usageEntries"></div>
   <p id="usageMsg"></p>
@@ -733,6 +760,7 @@ async function loadUsage() {
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error((d.error && d.error.message) || `HTTP ${r.status}`);
     renderUsage(d);
+    loadUsageAccounts();
   } catch (e) {
     $('usageMsg').textContent = '用量读取失败：' + e.message;
   }
@@ -744,7 +772,7 @@ function renderUsage(d) {
   if (Number.isInteger(d.hour)) { usageHour = d.hour; paintUsageHour(); }
   $('usageWindow').textContent = (d.windowStart && d.windowEnd) ? `统计区间 ${fmtWindowSH(d.windowStart)} → ${fmtWindowSH(d.windowEnd)}（北京时间）` : '';
   $('usageDay').innerHTML = days.map((dy) => `<option value="${esc(dy)}"${dy === d.day ? ' selected' : ''}>${esc(dy)}</option>`).join('');
-  $('usageSummary').innerHTML = `<div class="ustats"><div class="ustat"><b>${d.total || 0}</b><span>总数</span></div><div class="ustat ok"><b>${d.ok || 0}</b><span>成功</span></div><div class="ustat fail"><b>${d.fail || 0}</b><span>失败</span></div></div>`;
+  $('usageSummary').innerHTML = `<div class="ustats"><div class="ustat total"><b>${d.total || 0}</b><span>总数</span></div><div class="ustat ok"><b>${d.ok || 0}</b><span>成功</span></div><div class="ustat fail"><b>${d.fail || 0}</b><span>失败</span></div></div>`;
   $('usageModels').innerHTML = (d.byModel && d.byModel.length)
     ? `<div class="uchips">${d.byModel.map((m) => `<div class="uchip"><span class="um">${esc(m.model)}</span><span class="uc"><b>${m.total}</b> 条 · 成功 ${m.ok} · 失败 ${m.fail}</span></div>`).join('')}</div>`
     : '<p class="hint">这一天还没有生成请求。</p>';
@@ -760,6 +788,121 @@ function renderUsage(d) {
     : '<p class="hint">当天暂无记录。</p>';
   $('usageMsg').textContent = '';
 }
+
+// ---------------------------------------------------------------------------
+// 按账号：汇总来自无头账本（/api/console/usage/accounts）；选中某账号后，
+// 下面的流水换成该账号在账本里的记录（/api/console/usage/account-records）。
+// 筛选只留被选中的那张卡；下拉与卡片点击互相切换。
+// ---------------------------------------------------------------------------
+let usageAcctFilter = '';
+let usageAcctList = [];
+let usageAcctCursor = '';
+function fmtTok(n) {
+  if (n == null) return '0';
+  if (n >= 10000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + '万';
+  return String(n);
+}
+function fmtSec(ms) { return ms == null ? '' : (ms / 1000).toFixed(1).replace(/\.0$/, '') + 's'; }
+async function loadUsageAccounts() {
+  const key = keyInput.value.trim();
+  try {
+    const day = $('usageDay').value || '';
+    const qs = new URLSearchParams();
+    if (day) qs.set('day', day);
+    qs.set('hour', String(usageHour));
+    const r = await fetch('/api/console/usage/accounts?' + qs.toString(), {
+      headers: { 'X-API-Key': key },
+      credentials: 'same-origin',
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((d.error && d.error.message) || `HTTP ${r.status}`);
+    usageAcctList = Array.isArray(d.accounts) ? d.accounts : [];
+    $('usageAcctMsg').textContent = '';
+    renderUsageAccounts();
+    if (usageAcctFilter) loadUsageAccountRecords(false);
+  } catch (e) {
+    $('usageAcctMsg').textContent = '按账号数据暂时取不到：' + e.message;
+  }
+}
+function renderUsageAccounts() {
+  const sel = $('usageAcctSel');
+  const emails = usageAcctList.map((a) => a.account);
+  if (usageAcctFilter && !emails.includes(usageAcctFilter)) usageAcctFilter = '';
+  sel.innerHTML = '<option value="">全部账号</option>' + emails.map((m) => `<option value="${esc(m)}"${m === usageAcctFilter ? ' selected' : ''}>${esc(m)}</option>`).join('');
+  sel.value = usageAcctFilter;
+  const totalReq = usageAcctList.reduce((s, a) => s + (a.requests || 0), 0);
+  const shown = usageAcctFilter ? usageAcctList.filter((a) => a.account === usageAcctFilter) : usageAcctList;
+  $('usageAccounts').innerHTML = shown.length
+    ? shown.map((a) => {
+        const pct = totalReq ? Math.round((a.requests || 0) / totalReq * 100) : 0;
+        return `<div class="uacct ${a.account === usageAcctFilter ? 'on' : ''}" data-acct="${esc(a.account)}">
+          <div class="ua-top"><span class="ua-mail mono">${esc(a.account)}</span><span class="ua-total"><b>${a.requests || 0}</b><span>总请求</span></span></div>
+          <div class="ua-nums">成功 <span class="okn">${a.succeeded || 0}</span> · 失败 <span class="failn">${a.failed || 0}</span>${a.canceled ? ` · 取消 ${a.canceled}` : ''} · 占全部 ${pct}%</div>
+          <span class="ua-bar"><i style="width:${pct}%"></i></span>
+          <div class="ua-cap">本窗口用量占比</div>
+          <div class="ua-tok">Token：输入 ${fmtTok(a.inputTokens)} · 回复 ${fmtTok(a.replyTokens)} · 共 ${fmtTok(a.totalTokens)}${a.cachedTokens ? ` · 其中缓存命中 ${fmtTok(a.cachedTokens)}` : ''}</div>
+        </div>`;
+      }).join('')
+    : '<p class="hint">这个窗口里无头账本还没有记录。</p>';
+  document.querySelectorAll('.uacct').forEach((el) => {
+    el.onclick = () => {
+      const m = el.dataset.acct || '';
+      usageAcctFilter = (usageAcctFilter === m) ? '' : m;
+      renderUsageAccounts();
+      if (usageAcctFilter) loadUsageAccountRecords(false); else loadUsage();
+    };
+  });
+}
+async function loadUsageAccountRecords(more) {
+  const key = keyInput.value.trim();
+  const acct = usageAcctFilter;
+  if (!acct) return;
+  try {
+    const day = $('usageDay').value || '';
+    const qs = new URLSearchParams();
+    if (day) qs.set('day', day);
+    qs.set('hour', String(usageHour));
+    qs.set('account', acct);
+    if (more && usageAcctCursor) qs.set('cursor', usageAcctCursor);
+    const r = await fetch('/api/console/usage/account-records?' + qs.toString(), {
+      headers: { 'X-API-Key': key },
+      credentials: 'same-origin',
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((d.error && d.error.message) || `HTTP ${r.status}`);
+    if (usageAcctFilter !== acct) return; // 用户已切走，丢弃这次结果
+    usageAcctCursor = d.nextCursor || '';
+    const cards = (d.entries || []).map((e) => {
+      const statusPill = e.ok
+        ? `<span class="upill ok">成功 ${e.status || ''}</span>`
+        : `<span class="upill fail">失败 ${e.status || ''}</span>`;
+      const tt = (e.ttfbMs != null && e.ttfbMs > 0) ? `首字 ${fmtSec(e.ttfbMs)}` : '';
+      const dur = e.durMs != null ? `共 ${fmtSec(e.durMs)}` : '';
+      const durTxt = [tt, dur].filter(Boolean).join(' · ');
+      const tok = e.totalTokens ? `<div class="umeta">Token 输入 ${fmtTok(e.inputTokens)} · 回复 ${fmtTok(e.replyTokens)} · 共 ${fmtTok(e.totalTokens)}</div>` : '';
+      const errBox = (!e.ok && e.error) ? `<div class="uerr">${esc(e.error)}</div>` : '';
+      return `<div class="ucard ${e.ok ? 'ok' : 'fail'}"><div class="umodel mono">${esc(e.model)}</div><div class="urow"><span class="mono">${fmtTimeSH(e.ts)}</span><span class="upill ch">云端</span>${statusPill}<span class="udur mono">${durTxt}</span></div>${tok}${errBox}</div>`;
+    }).join('');
+    const moreBtn = usageAcctCursor ? '<button type="button" class="secondary" id="usageAcctMore" style="width:100%;margin:4px 0 8px">加载更多</button>' : '';
+    if (more) {
+      const old = $('usageAcctMore'); if (old) old.remove();
+      $('usageEntries').insertAdjacentHTML('beforeend', cards + moreBtn);
+    } else {
+      const head = `<p class="hint" style="margin-bottom:8px">只看 <b class="mono">${esc(acct)}</b> 的流水（来自无头账本）：</p>`;
+      $('usageEntries').innerHTML = cards ? head + cards + moreBtn : '<p class="hint">这个账号在这个窗口里还没有记录。</p>';
+    }
+    const mb = $('usageAcctMore');
+    if (mb) mb.onclick = () => loadUsageAccountRecords(true);
+    $('usageAcctMsg').textContent = '';
+  } catch (e) {
+    $('usageAcctMsg').textContent = '该账号流水取不到：' + e.message;
+  }
+}
+$('usageAcctSel').onchange = () => {
+  usageAcctFilter = $('usageAcctSel').value || '';
+  renderUsageAccounts();
+  if (usageAcctFilter) loadUsageAccountRecords(false); else loadUsage();
+};
 
 $('usageDay').onchange = loadUsage;
 $('usageRefresh').onclick = loadUsage;
