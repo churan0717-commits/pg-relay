@@ -22,6 +22,7 @@ cd "$(dirname "$0")"
 python3 main.py server --port 8081 &
 API_PID=$!
 OAI_BRIDGE_HOST=0.0.0.0 OAI_BRIDGE_PORT=8080 OAI_BRIDGE_UPSTREAM=http://127.0.0.1:8081 \
+    OAI_BRIDGE_USAGE_FILE=/app/data/usage.jsonl \
     python3 oai-bridge.py &
 BR_PID=$!
 
