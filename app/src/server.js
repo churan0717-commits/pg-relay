@@ -910,6 +910,17 @@ function usageDayKey(ts) {
   return new Date(ts + 8 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
+// 分日点（hour=0..23，Asia/Shanghai）：「某日」= 当日 hour:00 → 次日 hour:00。
+// hour=0 与 usageDayKey 完全一致（中国日）；hour=15 对齐谷歌额度按美国
+// 太平洋午夜刷新的节奏（美国日，北京时间 15:00 → 次日 15:00）。
+function usageWindowKey(ts, hour) {
+  return usageDayKey(ts - hour * 3600 * 1000);
+}
+function usageWindowRange(dayStr, hour) {
+  const start = Date.parse(dayStr + 'T00:00:00Z') + (hour - 8) * 3600 * 1000;
+  return { start, end: start + 24 * 3600 * 1000 };
+}
+
 function recordUsage(rec) {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -982,14 +993,17 @@ function pruneUsageLog() {
 pruneUsageLog();
 setInterval(pruneUsageLog, 6 * 3600 * 1000).unref();
 
-// 某日汇总：day 缺省/格式不对 → 今天（Asia/Shanghai）；days 为有数据的
-// 日期倒序；byModel 按条数倒序；errors 为当天失败（最新在前，最多 50 条）；
+// 某日汇总：day 缺省/格式不对 → 当前分日窗口（Asia/Shanghai）；hour 为分日点
+// （0=中国日 0 点起算，15=美国日 15 点起算，缺省 0）；days 为有数据的日期
+// 倒序；byModel 按条数倒序；errors 为当天失败（最新在前，最多 50 条）；
 // entries 为当天全部流水（最新在前，最多 300 条），供管理台逐条看时间明细。
-function usageSummary(dayParam) {
+function usageSummary(dayParam, hourParam) {
   const records = readUsageRecords();
-  const days = [...new Set(records.map((r) => usageDayKey(Number(r.ts))))].sort().reverse();
-  const day = /^\d{4}-\d{2}-\d{2}$/.test(dayParam || '') ? dayParam : usageDayKey(Date.now());
-  const todays = records.filter((r) => usageDayKey(Number(r.ts)) === day);
+  const hourNum = Number(hourParam);
+  const hour = Number.isInteger(hourNum) && hourNum >= 0 && hourNum <= 23 ? hourNum : 0;
+  const days = [...new Set(records.map((r) => usageWindowKey(Number(r.ts), hour)))].sort().reverse();
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(dayParam || '') ? dayParam : usageWindowKey(Date.now(), hour);
+  const todays = records.filter((r) => usageWindowKey(Number(r.ts), hour) === day);
   const byModelMap = new Map();
   let ok = 0;
   for (const r of todays) {
@@ -1028,7 +1042,8 @@ function usageSummary(dayParam) {
       durMs: numOrNull(r.durMs),
       ttfbMs: numOrNull(r.ttfbMs),
     }));
-  return { day, days, total: todays.length, ok, fail: todays.length - ok, byModel, errors, entries };
+  const range = usageWindowRange(day, hour);
+  return { day, days, hour, windowStart: range.start, windowEnd: range.end, total: todays.length, ok, fail: todays.length - ok, byModel, errors, entries };
 }
 
 // ---------------------------------------------------------------------------
@@ -3692,7 +3707,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && pathname === '/api/console/usage') {
       if (!requireConsoleAuth(req, res, url)) return;
-      return sendJson(res, 200, { ok: true, ...usageSummary(url.searchParams.get('day') || '') });
+      return sendJson(res, 200, { ok: true, ...usageSummary(url.searchParams.get('day') || '', url.searchParams.get('hour') || '') });
     }
 
     if (req.method === 'GET' && pathname === '/api/console/pggo') {

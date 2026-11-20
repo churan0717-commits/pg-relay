@@ -39,6 +39,7 @@
   #poolMsg { min-height: 20px; font-size: 14px; margin: 8px 0 0; }
   #subNodeMsg { min-height: 20px; font-size: 14px; margin: 8px 0 0; }
   #usageMsg { min-height: 20px; font-size: 14px; margin: 8px 0 0; }
+  .uhour.on { background: linear-gradient(135deg, #ff9e7a, #ff7e5f); color: #fff; border-color: #ff8a66; box-shadow: 0 3px 10px rgba(255,126,95,.25); }
   .wrapany { overflow-wrap: anywhere; }
   .num { white-space: nowrap; }
   .uentry { padding: 7px 0; border-bottom: 1px solid #f6e3cd; }
@@ -182,10 +183,16 @@
 
 <div class="card" data-tab="usage">
   <h2>今日用量</h2>
-  <p class="hint">只统计生成请求（聊天 / generateContent，含一期 pg- 与二期 pggo-）。记录保留最近 14 天，按 Asia/Shanghai 切日。</p>
+  <p class="hint">只统计生成请求（聊天 / generateContent，含一期 pg- 与二期 pggo-）。记录保留最近 14 天。「分日点」决定一天从几点算起：0 点是中国日（今天 0 点 → 明天 0 点）；15 点是美国日（今天 15 点 → 明天 15 点），对齐谷歌额度刷新点，看这个额度周期里用了多少就选它。</p>
   <div class="row">
     <select id="usageDay"></select>
     <button class="secondary" id="usageRefresh">刷新用量</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <span class="hint">分日点：</span>
+    <button type="button" class="secondary uhour" data-hour="0">0 点 · 中国日</button>
+    <button type="button" class="secondary uhour" data-hour="15">15 点 · 美国日</button>
+    <span class="hint" id="usageWindow"></span>
   </div>
   <div id="usageSummary"></div>
   <div id="usageModels"></div>
@@ -693,12 +700,33 @@ function fmtDur(e) {
   }
   return s(dur != null ? dur : tt);
 }
+// 分日点（0=中国日 / 15=美国日）：存浏览器本地，点一下立即重拉用量。
+let usageHour = Number(localStorage.getItem('pgUsageHour') || 0);
+if (![0, 15].includes(usageHour)) usageHour = 0;
+function paintUsageHour() {
+  document.querySelectorAll('.uhour').forEach((b) => b.classList.toggle('on', Number(b.dataset.hour) === usageHour));
+}
+document.querySelectorAll('.uhour').forEach((b) => {
+  b.onclick = () => {
+    usageHour = Number(b.dataset.hour) || 0;
+    localStorage.setItem('pgUsageHour', String(usageHour));
+    paintUsageHour();
+    loadUsage();
+  };
+});
+paintUsageHour();
+function fmtWindowSH(ts) {
+  return new Date(ts + 8 * 3600 * 1000).toISOString().slice(5, 16).replace('T', ' ');
+}
 async function loadUsage() {
   const key = keyInput.value.trim();
   if (!key && !ownerState.ownerLoggedIn) return;
   try {
     const day = $('usageDay').value || '';
-    const r = await fetch('/api/console/usage' + (day ? `?day=${encodeURIComponent(day)}` : ''), {
+    const qs = new URLSearchParams();
+    if (day) qs.set('day', day);
+    qs.set('hour', String(usageHour));
+    const r = await fetch('/api/console/usage?' + qs.toString(), {
       headers: { 'X-API-Key': key },
       credentials: 'same-origin',
     });
@@ -711,7 +739,10 @@ async function loadUsage() {
 }
 
 function renderUsage(d) {
-  const days = Array.isArray(d.days) && d.days.length ? d.days : [d.day];
+  const days = Array.isArray(d.days) && d.days.length ? d.days.slice() : [d.day];
+  if (!days.includes(d.day)) days.unshift(d.day);
+  if (Number.isInteger(d.hour)) { usageHour = d.hour; paintUsageHour(); }
+  $('usageWindow').textContent = (d.windowStart && d.windowEnd) ? `统计区间 ${fmtWindowSH(d.windowStart)} → ${fmtWindowSH(d.windowEnd)}（北京时间）` : '';
   $('usageDay').innerHTML = days.map((dy) => `<option value="${esc(dy)}"${dy === d.day ? ' selected' : ''}>${esc(dy)}</option>`).join('');
   $('usageSummary').innerHTML = `<div class="ustats"><div class="ustat"><b>${d.total || 0}</b><span>总数</span></div><div class="ustat ok"><b>${d.ok || 0}</b><span>成功</span></div><div class="ustat fail"><b>${d.fail || 0}</b><span>失败</span></div></div>`;
   $('usageModels').innerHTML = (d.byModel && d.byModel.length)
