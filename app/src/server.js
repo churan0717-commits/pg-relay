@@ -2186,6 +2186,326 @@ async function handleChatCompletions(req, res, url) {
 }
 
 // ---------------------------------------------------------------------------
+// 任务 API /v1/openai/tasks（st-catiecli-tasks 扩展的提交/轮询/取消协议）
+// 酒馆前端断线/切后台不丢回复：生成在服务端跑完，SSE 分片存内存供轮询
+// 增量领取。实现方式：复用 handleChatCompletions 全管线——req 换成一次性
+// 内存流、res 换成 TaskResponseCollector 收集器；取消时对收集器 emit
+// ('close')，与直连时客户端断开走同一条取消路径（执行器 cancel 帧 /
+// 无头 AbortController / 用量按 499 client_disconnected 落账）。
+// ---------------------------------------------------------------------------
+const { EventEmitter } = require('node:events');
+const { Readable } = require('node:stream');
+
+const tasks = new Map(); // id -> task
+const TASK_KEEP_MS = 30 * 60 * 1000; // 终态任务保留时长
+const TASK_MAX_RUNNING = 8; // 并发在跑上限
+const TASK_MAX_CHUNK_BYTES = 32 * 1024 * 1024; // 单任务分片总量上限
+
+function taskKeyHash(key) {
+  return crypto.createHash('sha256').update(String(key || '')).digest('hex');
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, t] of tasks) {
+    if (t.status !== 'running' && t.finishedAt && now - t.finishedAt > TASK_KEEP_MS) {
+      tasks.delete(id);
+    }
+  }
+}, 5 * 60 * 1000).unref();
+
+function failTask(t, statusCode, message) {
+  if (t.status !== 'running') return;
+  t.status = 'failed';
+  t.error = message;
+  t.statusCode = statusCode;
+  t.done = true;
+  t.finishedAt = Date.now();
+}
+
+/** 从一个 SSE 事件文本里提取 error 帧信息（无则 null）。 */
+function sseEventError(chunk) {
+  for (const line of String(chunk).split(/\r?\n/)) {
+    if (!line.startsWith('data:')) continue;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') continue;
+    try {
+      const obj = JSON.parse(data);
+      if (obj && obj.error) {
+        const e = obj.error;
+        return {
+          message: typeof e === 'string' ? e : String(e.message || '上游错误'),
+          code: e && typeof e === 'object' && Number(e.code) ? Number(e.code) : null,
+        };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+/** 流式任务收尾：以 [DONE] 正常收束才算 completed；含 error 帧或缺 [DONE] 都算 failed 并补齐帧。 */
+function finishStreamTask(t) {
+  let errInfo = null;
+  let hasDone = false;
+  for (const c of t.chunks) {
+    if (c.includes('[DONE]')) hasDone = true;
+    if (!errInfo) errInfo = sseEventError(c);
+  }
+  if (errInfo) {
+    t.status = 'failed';
+    t.error = errInfo.message;
+    t.statusCode = errInfo.code || 502;
+    if (!hasDone) t.chunks.push('data: [DONE]\n\n');
+  } else if (!hasDone) {
+    t.status = 'failed';
+    t.error = '上游流提前结束（未收到 [DONE]）';
+    t.statusCode = 502;
+    t.chunks.push(
+      `data: ${JSON.stringify({ error: { message: t.error, type: 'relay_error', code: 'stream_truncated' } })}\n\n`,
+    );
+    t.chunks.push('data: [DONE]\n\n');
+  } else {
+    t.status = 'completed';
+  }
+  t.done = true;
+  t.finishedAt = Date.now();
+}
+
+/** 非流式任务收尾：HTTP 状态/错误体决定成败，成功时整个 JSON 即 result。 */
+function finishJsonTask(t, status, bodyText) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {}
+  if (status >= 400 || (parsed && parsed.error)) {
+    let msg = '';
+    let code = status >= 400 ? status : 502;
+    if (parsed && parsed.error) {
+      const e = parsed.error;
+      msg = typeof e === 'string' ? e : String(e.message || '');
+      if (status < 400 && e && typeof e === 'object' && Number(e.code)) code = Number(e.code);
+    }
+    if (!msg && parsed && parsed.message) msg = String(parsed.message);
+    if (!msg) msg = bodyText.slice(0, 500) || `上游返回 HTTP ${status}`;
+    t.status = 'failed';
+    t.error = msg;
+    t.statusCode = code;
+  } else if (parsed) {
+    t.status = 'completed';
+    t.result = parsed;
+  } else {
+    t.status = 'failed';
+    t.error = '上游响应解析失败';
+    t.statusCode = 502;
+  }
+  t.done = true;
+  t.finishedAt = Date.now();
+}
+
+/**
+ * 顶替 HTTP res 的收集器：writeHead 记状态与内容类型；SSE 响应按事件
+ * 边界（空行）切成 chunks 逐个入任务；JSON 响应整存待 end 时解析。
+ * 对外接口与 ServerResponse 对齐到管线实际用到的子集：
+ * writeHead/write/end/headersSent/on('close')。
+ */
+class TaskResponseCollector extends EventEmitter {
+  constructor(task) {
+    super();
+    this.task = task;
+    this.statusCode = 200;
+    this.headersSent = false;
+    this.ended = false;
+    this._isSse = false;
+    this._sseBuf = '';
+    this._body = '';
+  }
+
+  writeHead(status, headers) {
+    if (this.headersSent) return this;
+    this.statusCode = status;
+    const ct = String((headers && (headers['Content-Type'] || headers['content-type'])) || '');
+    this._isSse = ct.includes('text/event-stream');
+    this.headersSent = true;
+    return this;
+  }
+
+  write(chunk) {
+    if (this.ended || chunk == null) return false;
+    const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+    if (this._isSse) this._feedSse(text);
+    else this._body += text;
+    return true;
+  }
+
+  end(chunk) {
+    if (chunk != null) this.write(chunk);
+    if (this.ended) return this;
+    this.ended = true;
+    this._finish();
+    return this;
+  }
+
+  _feedSse(text) {
+    this._sseBuf += text;
+    for (;;) {
+      const lf = this._sseBuf.indexOf('\n\n');
+      const crlf = this._sseBuf.indexOf('\r\n\r\n');
+      let idx = -1;
+      let sepLen = 0;
+      if (lf >= 0 && (crlf < 0 || lf < crlf)) {
+        idx = lf;
+        sepLen = 2;
+      } else if (crlf >= 0) {
+        idx = crlf;
+        sepLen = 4;
+      }
+      if (idx < 0) break;
+      const ev = this._sseBuf.slice(0, idx + sepLen);
+      this._sseBuf = this._sseBuf.slice(idx + sepLen);
+      this._pushChunk(ev);
+    }
+  }
+
+  _pushChunk(ev) {
+    const t = this.task;
+    if (t.status !== 'running') return;
+    t.chunkBytes += Buffer.byteLength(ev, 'utf8');
+    if (t.chunkBytes > TASK_MAX_CHUNK_BYTES) {
+      // 超量：补错误帧 + [DONE] 后置失败，并异步触发取消路径中止生成
+      t.chunks.push(
+        `data: ${JSON.stringify({ error: { message: '任务输出超过上限（32MB），已中止', type: 'relay_error', code: 'task_too_large' } })}\n\n`,
+      );
+      t.chunks.push('data: [DONE]\n\n');
+      failTask(t, 502, '任务输出超过上限（32MB），已中止');
+      queueMicrotask(() => {
+        try { this.emit('close'); } catch {}
+      });
+      return;
+    }
+    t.chunks.push(ev);
+  }
+
+  _finish() {
+    const t = this.task;
+    if (t.status !== 'running') return; // 已被取消/超量置终态：迟到收尾丢弃
+    if (this._isSse) {
+      if (this._sseBuf) {
+        const rest = this._sseBuf;
+        this._sseBuf = '';
+        t.chunkBytes += Buffer.byteLength(rest, 'utf8');
+        t.chunks.push(rest);
+      }
+      finishStreamTask(t);
+    } else {
+      finishJsonTask(t, this.statusCode, this._body);
+    }
+  }
+}
+
+async function handleTaskSubmit(req, res, url) {
+  if (!requireAuth(req, res, url)) return;
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (e) {
+    return openAiError(res, e.httpStatus || 400, e.message, 'invalid_body');
+  }
+  let running = 0;
+  for (const t of tasks.values()) if (t.status === 'running') running++;
+  if (running >= TASK_MAX_RUNNING) {
+    return sendJson(res, 429, {
+      error: {
+        message: `并发任务已达上限（${TASK_MAX_RUNNING}），请稍后再试`,
+        type: 'relay_error',
+        code: 'too_many_tasks',
+      },
+    });
+  }
+  const task = {
+    id: `task_${crypto.randomBytes(12).toString('hex')}`,
+    ownerKeyHash: taskKeyHash(extractKey(req, url)),
+    createdAt: Date.now(),
+    finishedAt: null,
+    status: 'running',
+    done: false,
+    stream: !!body.stream,
+    chunks: [],
+    chunkBytes: 0,
+    result: null,
+    error: null,
+    statusCode: null,
+    collector: null,
+  };
+  const collector = new TaskResponseCollector(task);
+  task.collector = collector;
+  tasks.set(task.id, task);
+  sendJson(res, 200, { id: task.id });
+  // 后台跑现有生成管线：req 换一次性内存流（headers 沿用真实请求，
+  // 管线内的 requireAuth/readJsonBody 照常工作），res 换收集器。
+  const fakeReq = Readable.from([Buffer.from(JSON.stringify(body))]);
+  fakeReq.headers = req.headers;
+  fakeReq.method = 'POST';
+  handleChatCompletions(fakeReq, collector, url).catch((e) => {
+    if (task.status !== 'running') return;
+    try {
+      if (!collector.headersSent) {
+        collector.writeHead(502, { 'Content-Type': 'application/json' });
+        collector.end(JSON.stringify({ error: { message: `内部错误: ${e.message}` } }));
+      } else {
+        collector.end();
+      }
+    } catch {}
+  });
+}
+
+function lookupTask(req, res, url, id) {
+  const t = tasks.get(id);
+  if (!t || t.ownerKeyHash !== taskKeyHash(extractKey(req, url))) {
+    sendJson(res, 404, {
+      error: { message: '任务不存在', type: 'invalid_request_error', code: 'task_not_found' },
+    });
+    return null;
+  }
+  return t;
+}
+
+function handleTaskPoll(req, res, url, id) {
+  if (!requireAuth(req, res, url)) return;
+  const t = lookupTask(req, res, url, id);
+  if (!t) return;
+  let after = Number(url.searchParams.get('after'));
+  if (!Number.isFinite(after) || after < 0) after = 0;
+  after = Math.min(Math.floor(after), t.chunks.length);
+  return sendJson(res, 200, {
+    id: t.id,
+    chunks: t.chunks.slice(after),
+    next_after: t.chunks.length,
+    done: t.done,
+    status: t.status,
+    stream: t.stream,
+    result: t.result,
+    error: t.error,
+    status_code: t.statusCode,
+  });
+}
+
+function handleTaskCancel(req, res, url, id) {
+  if (!requireAuth(req, res, url)) return;
+  const t = lookupTask(req, res, url, id);
+  if (!t) return;
+  if (t.status === 'running') {
+    t.status = 'cancelled';
+    t.done = true;
+    t.finishedAt = Date.now();
+    // 对收集器发 close：与直连客户端断开完全相同的取消路径
+    if (t.collector) {
+      try { t.collector.emit('close'); } catch {}
+    }
+  }
+  return sendJson(res, 200, { ok: true, id: t.id, status: t.status });
+}
+
+// ---------------------------------------------------------------------------
 // Gemini 原生 /v1beta/models/{model}:generateContent | :streamGenerateContent
 // ---------------------------------------------------------------------------
 async function handleGemini(req, res, url, modelRaw, action) {
@@ -2833,6 +3153,18 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && pathname === '/v1/chat/completions') {
       return await handleChatCompletions(req, res, url);
+    }
+
+    if (req.method === 'POST' && pathname === '/v1/openai/tasks') {
+      return await handleTaskSubmit(req, res, url);
+    }
+
+    const taskMatch = pathname.match(/^\/v1\/openai\/tasks\/([^/]+)(\/cancel)?$/);
+    if (taskMatch && req.method === 'GET' && !taskMatch[2]) {
+      return handleTaskPoll(req, res, url, decodeURIComponent(taskMatch[1]));
+    }
+    if (taskMatch && req.method === 'POST' && taskMatch[2]) {
+      return handleTaskCancel(req, res, url, decodeURIComponent(taskMatch[1]));
     }
 
     const geminiMatch = pathname.match(/^\/v1beta\/models\/(.+?):(generateContent|streamGenerateContent)$/);
