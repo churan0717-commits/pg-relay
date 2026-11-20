@@ -905,7 +905,24 @@ $('usageAcctSel').onchange = () => {
 };
 
 $('usageDay').onchange = loadUsage;
-$('usageRefresh').onclick = loadUsage;
+$('usageRefresh').onclick = async () => {
+  const btn = $('usageRefresh');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '刷新中…';
+  try {
+    await loadUsage();
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, '0');
+    const mm = String(now.getMinutes()).padStart(2, '0');
+    const ss = String(now.getSeconds()).padStart(2, '0');
+    $('usageMsg').textContent = `已刷新 · ${hh}:${mm}:${ss}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+};
 
 $('saveKey').onclick = () => {
   localStorage.setItem('pgrelay_key', keyInput.value.trim());

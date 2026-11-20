@@ -1073,7 +1073,7 @@ async function hlUsageByAccount(win) {
   const rep = await r.json().catch(() => null);
   const groups = rep && rep.groups && Array.isArray(rep.groups.account) ? rep.groups.account : [];
   const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
-  return groups
+  const rows = groups
     .map((g) => ({
       account: String(g.key || ''),
       requests: num(g.requests),
@@ -1087,8 +1087,24 @@ async function hlUsageByAccount(win) {
       replyTokens: num(g.reply_tokens),
       totalTokens: num(g.total_tokens),
     }))
-    .filter((a) => a.account)
-    .sort((a, b) => b.requests - a.requests);
+    .filter((a) => a.account);
+  // 账本只列本窗口有过用量的账号；新导入还没跑过请求的号要按全量名单补进来（0 用量也显示），否则下拉里永远看不到新号
+  try {
+    const acc = await hlAccounts();
+    const known = (acc.accounts || []).map((a) => String((a && (a.id || a.label)) || '')).filter(Boolean);
+    const byEmail = new Map(rows.map((row) => [row.account, row]));
+    for (const email of known) {
+      if (!byEmail.has(email)) {
+        byEmail.set(email, {
+          account: email, requests: 0, succeeded: 0, failed: 0, canceled: 0, rateLimited: 0,
+          inputTokens: 0, cachedTokens: 0, reasoningTokens: 0, replyTokens: 0, totalTokens: 0,
+        });
+      }
+    }
+    return [...byEmail.values()].sort((a, b) => b.requests - a.requests);
+  } catch {
+    return rows.sort((a, b) => b.requests - a.requests);
+  }
 }
 
 async function hlUsageAccountRecords(win, account, cursor) {
