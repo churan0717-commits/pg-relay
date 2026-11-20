@@ -60,6 +60,17 @@ def to_gemini(body):
     stop = body.get("stop")
     if stop:
         cfg["stopSequences"] = [stop] if isinstance(stop, str) else stop
+    # gemini-4 系列默认思考会把输出额度烧光、正文一个字不出（酒馆表现为�空回）。
+    # 实测 thinkingBudget 不生效、thinkingLevel 生效：默认压到 low 档。
+    # 客户端带 reasoning_effort 时按它映射；环境变量 OAI_BRIDGE_THINKING_LEVEL 可改默认值，设 off 则不注入。
+    lvl = None
+    effort = body.get("reasoning_effort")
+    if isinstance(effort, str) and effort:
+        lvl = {"minimal": "low", "low": "low", "medium": "medium", "high": "high"}.get(effort.lower())
+    if lvl is None:
+        lvl = os.environ.get("OAI_BRIDGE_THINKING_LEVEL", "low")
+    if lvl and lvl != "off":
+        cfg["thinkingConfig"] = {"thinkingLevel": lvl}
     if cfg:
         req["generationConfig"] = cfg
     return req
