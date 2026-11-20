@@ -17,6 +17,7 @@
  */
 
 const http = require('node:http');
+const https = require('node:https');
 const net = require('node:net');
 const tls = require('node:tls');
 const fs = require('node:fs');
@@ -105,6 +106,143 @@ function savePggoState() {
   } catch (e) {
     console.error('[pg-relay] pggo 状态落盘失败', e.message);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Robin 通道：脚本在谷歌 EmbeddedSetup 登录流程页推送 oauth_token
+// （POST /api/robin/bind-by-key，X-API-Key 鉴权），服务端立刻用 gpsoauth
+// 协议把它兑换成长期主令牌（master token）存 data/robin-state.json
+// （600 权限，与 pggo-state.json 同目录同卷）。oauth_token 本身只有几分钟
+// 寿命、只在内存里过手兑换，绝不落盘。主令牌是账号级长期凭证（改密才
+// 失效、权限比 Cookie 大）：只存卷内，管理台只显示邮箱/绑定时间/令牌
+// 种类前缀，永不回传令牌本体。
+const ROBIN_STATE_PATH = path.join(DATA_DIR, 'robin-state.json');
+let robinState = { accounts: {} }; // email -> { masterToken, androidId, boundAt, updatedAt }
+try {
+  const saved = JSON.parse(fs.readFileSync(ROBIN_STATE_PATH, 'utf8'));
+  if (saved && typeof saved === 'object' && saved.accounts && typeof saved.accounts === 'object') {
+    robinState = { accounts: saved.accounts };
+  }
+} catch {}
+function saveRobinState() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(ROBIN_STATE_PATH, JSON.stringify(robinState, null, 2) + '\n', { mode: 0o600 });
+  } catch (e) {
+    console.error('[pg-relay] robin 状态落盘失败', e.message);
+  }
+}
+
+// gpsoauth 兑换：POST android.clients.google.com/auth（表单编码），参数
+// 逐字对齐开源 gpsoauth 的 build_exchange_token_data。TLS 按其要求处理：
+// 不发 ALPN、保留会话票据、指定密码套件——Google 对这三点挑剔，不对会回
+// BadAuthentication。响应是 key=value 逐行文本，Token 字段即主令牌。
+const GPSOAUTH_CIPHERS = [
+  'ECDHE+AESGCM', 'ECDHE+CHACHA20', 'DHE+AESGCM', 'DHE+CHACHA20',
+  'ECDH+AES', 'DH+AES', 'RSA+AESGCM', 'RSA+AES', '!aNULL', '!eNULL', '!MD5', '!DSS',
+].join(':');
+function gpsoauthPost(fields) {
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams(fields).toString();
+    const req = https.request(
+      {
+        hostname: 'android.clients.google.com',
+        path: '/auth',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'GoogleAuth/1.4',
+          'Accept-Encoding': 'identity',
+          'Content-Length': Buffer.byteLength(body),
+        },
+        ciphers: GPSOAUTH_CIPHERS,
+        timeout: 20000,
+      },
+      (resp) => {
+        const chunks = [];
+        resp.on('data', (c) => chunks.push(c));
+        resp.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          const out = {};
+          for (const line of text.split('\n')) {
+            const i = line.indexOf('=');
+            if (i > 0) out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+          }
+          resolve({ status: resp.statusCode, fields: out });
+        });
+      }
+    );
+    req.on('timeout', () => req.destroy(new Error('gpsoauth 请求超时')));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+async function robinExchangeToken(email, oauthToken, androidId) {
+  const { fields } = await gpsoauthPost({
+    accountType: 'HOSTED_OR_GOOGLE',
+    Email: email,
+    has_permission: '1',
+    add_account: '1',
+    ACCESS_TOKEN: '1',
+    Token: oauthToken,
+    service: 'ac2dm',
+    source: 'android',
+    androidId,
+    device_country: 'us',
+    operatorCountry: 'us',
+    lang: 'en',
+    sdk_version: '17',
+    google_play_services_version: '240913000',
+    client_sig: '38918a453d07199354f8b19af05ec6562ced5788',
+    callerSig: '38918a453d07199354f8b19af05ec6562ced5788',
+    droidguard_results: 'dummy123',
+  });
+  if (fields.Token) return fields.Token;
+  throw new Error(fields.Error ? `Google 回：${fields.Error}` : 'Google 未返回主令牌');
+}
+
+// Robin 绑定入口（脚本推送）：校验 → 立刻兑换 → 存主令牌。
+// 响应形状按脚本约定：成功 200 {status:'ok', message}；失败带 detail 文案，
+// 脚本弹窗会原样显示 detail。
+async function handleRobinBind(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (e) {
+    return sendJson(res, e.httpStatus || 400, { detail: '请求体不是合法 JSON' });
+  }
+  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const oauthToken = typeof body.oauth_token === 'string' ? body.oauth_token.trim() : '';
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return sendJson(res, 400, { detail: '邮箱格式不对，已拒绝' });
+  }
+  if (!oauthToken.startsWith('oauth2_')) {
+    return sendJson(res, 400, {
+      detail: 'oauth_token 格式不对（应以 oauth2_ 开头）。请确认已完成登录并点过「I agree」，再重新推送。',
+    });
+  }
+  const prev = robinState.accounts[email];
+  const androidId = (prev && prev.androidId) || crypto.randomBytes(8).toString('hex');
+  let masterToken;
+  try {
+    masterToken = await robinExchangeToken(email, oauthToken, androidId);
+  } catch (e) {
+    return sendJson(res, 502, {
+      detail: `主令牌兑换失败：${e.message}。oauth_token 有效期只有几分钟，过期请重新走一遍登录再推送。`,
+    });
+  }
+  const now = new Date().toISOString();
+  robinState.accounts[email] = {
+    masterToken,
+    androidId,
+    boundAt: prev ? prev.boundAt : now,
+    updatedAt: now,
+  };
+  saveRobinState();
+  return sendJson(res, 200, {
+    status: 'ok',
+    message: '已兑换为长期主令牌并保存到蜜桃可可（相同邮箱重复推送自动覆盖）',
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2988,6 +3126,36 @@ const server = http.createServer(async (req, res) => {
       return await handleConsolePggoImport(req, res, url);
     }
 
+    if (req.method === 'GET' && pathname === '/api/console/robin') {
+      if (!requireConsoleAuth(req, res, url)) return;
+      const accounts = Object.entries(robinState.accounts)
+        .map(([email, a]) => ({
+          email,
+          boundAt: a.boundAt || null,
+          updatedAt: a.updatedAt || null,
+          tokenKind: String(a.masterToken || '').split('/')[0] || '',
+        }))
+        .sort((x, y) => x.email.localeCompare(y.email));
+      return sendJson(res, 200, { ok: true, accounts });
+    }
+
+    if (req.method === 'POST' && pathname === '/api/console/robin/delete') {
+      if (!requireConsoleAuth(req, res, url)) return;
+      let delBody;
+      try {
+        delBody = await readJsonBody(req);
+      } catch (e) {
+        return sendJson(res, e.httpStatus || 400, { error: { message: e.message, code: 'invalid_body' } });
+      }
+      const delEmail = typeof delBody.email === 'string' ? delBody.email.trim().toLowerCase() : '';
+      const existed = Boolean(robinState.accounts[delEmail]);
+      if (existed) {
+        delete robinState.accounts[delEmail];
+        saveRobinState();
+      }
+      return sendJson(res, 200, { ok: true, removed: existed });
+    }
+
     if (req.method === 'GET' && pathname === '/api/console/pool') {
       if (!requireConsoleAuth(req, res, url)) return;
       return sendJson(res, 200, {
@@ -3105,11 +3273,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && pathname === '/api/robin/bind-by-key') {
       if (!requireAuth(req, res, url)) return;
-      return sendJson(res, 501, {
-        ok: false,
-        error: 'phase2_not_available',
-        message: 'Robin 凭证线不在一期范围内。',
-      });
+      return await handleRobinBind(req, res);
     }
 
     if (req.method === 'GET' && pathname === '/v1/models') {
