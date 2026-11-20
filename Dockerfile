@@ -4,6 +4,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     AISTUDIO_DATA_DIR=/app/data \
+    AISTUDIO_ACCOUNTS_DIR=/app/data/accounts \
     AISTUDIO_CONFIG_FILE=/app/data/config.yaml
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
