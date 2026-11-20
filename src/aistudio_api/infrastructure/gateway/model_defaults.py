@@ -1,0 +1,1093 @@
+"""Model-specific default behaviors for AI Studio wire requests."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+
+import yaml
+
+from aistudio_api.config import resolve_config_file
+
+from .wire_types import (
+    AistudioImageOutputMode,
+    AistudioThinkingConfig,
+    ImageOutputType,
+    MediaResolution,
+    ThinkingLevel,
+)
+
+_resolve_config_path = resolve_config_file
+_SAFETY_CATEGORY_ORDER = (
+    ("harassment", 7),
+    ("hate", 8),
+    ("sexually explicit", 9),
+    ("dangerous content", 10),
+)
+
+
+@dataclass(frozen=True)
+class TierQuotaLimits:
+    daily_limit: int = 20
+    daily_token_limit: int | None = None
+
+
+@dataclass(frozen=True)
+class ModelDefaults:
+    is_image_model: bool = False
+    default_tools: tuple[str, ...] = ()
+    generation_config_defaults: dict[str, object] = field(default_factory=dict)
+    clear_generation_config_indexes: tuple[int, ...] = ()
+    safety_settings: tuple[tuple[object, ...], ...] | None = None
+    disable_safety_settings: bool = False
+    drop_unsupported_params: bool = False
+    specified_fields: frozenset[str] = frozenset()
+
+    def generation_config_overrides(self) -> dict[str, object]:
+        return dict(self.generation_config_defaults)
+
+    def safety_settings_overrides(self) -> list[list[object]] | None:
+        if self.safety_settings is None:
+            return None
+        return [list(item) for item in self.safety_settings]
+
+    def merged(self, other: ModelDefaults) -> ModelDefaults:
+        merged_generation = dict(self.generation_config_defaults)
+        merged_generation.update(other.generation_config_defaults)
+        merged_tools = self.default_tools + tuple(
+            tool for tool in other.default_tools if tool not in self.default_tools
+        )
+        merged_indexes = self.clear_generation_config_indexes + tuple(
+            idx
+            for idx in other.clear_generation_config_indexes
+            if idx not in self.clear_generation_config_indexes
+        )
+        return ModelDefaults(
+            is_image_model=self.is_image_model or other.is_image_model,
+            default_tools=merged_tools,
+            generation_config_defaults=merged_generation,
+            clear_generation_config_indexes=merged_indexes,
+            safety_settings=other.safety_settings
+            if other.safety_settings is not None
+            else self.safety_settings,
+            disable_safety_settings=self.disable_safety_settings
+            or other.disable_safety_settings,
+            drop_unsupported_params=(
+                other.drop_unsupported_params
+                if "drop_unsupported_params" in other.specified_fields
+                else self.drop_unsupported_params
+            ),
+            specified_fields=self.specified_fields | other.specified_fields,
+        )
+
+    def overridden(self, other: ModelDefaults) -> ModelDefaults:
+        merged_generation = dict(self.generation_config_defaults)
+        if "generation_config_defaults" in other.specified_fields:
+            merged_generation.update(other.generation_config_defaults)
+        return ModelDefaults(
+            is_image_model=other.is_image_model
+            if "is_image_model" in other.specified_fields
+            else self.is_image_model,
+            default_tools=other.default_tools
+            if "default_tools" in other.specified_fields
+            else self.default_tools,
+            generation_config_defaults=merged_generation,
+            clear_generation_config_indexes=(
+                other.clear_generation_config_indexes
+                if "clear_generation_config_indexes" in other.specified_fields
+                else self.clear_generation_config_indexes
+            ),
+            safety_settings=other.safety_settings
+            if "safety_settings" in other.specified_fields
+            else self.safety_settings,
+            disable_safety_settings=(
+                other.disable_safety_settings
+                if "disable_safety_settings" in other.specified_fields
+                else self.disable_safety_settings
+            ),
+            drop_unsupported_params=(
+                other.drop_unsupported_params
+                if "drop_unsupported_params" in other.specified_fields
+                else self.drop_unsupported_params
+            ),
+            specified_fields=self.specified_fields | other.specified_fields,
+        )
+
+
+@dataclass(frozen=True)
+class ModelProfile:
+    name: str
+    exact: tuple[str, ...] = ()
+    prefixes: tuple[str, ...] = ()
+    contains: tuple[str, ...] = ()
+    defaults: ModelDefaults = field(default_factory=ModelDefaults)
+
+    def matches(self, model: str) -> bool:
+        return bool(
+            (self.exact and model in self.exact)
+            or any(model.startswith(prefix) for prefix in self.prefixes)
+            or any(token in model for token in self.contains)
+        )
+
+
+def normalize_model_name(model: str) -> str:
+    """Normalize model string (strip, lowercase, remove 'models/' prefix)."""
+    return model.strip().removeprefix("models/").lower()
+
+
+_normalize_model_name = normalize_model_name
+
+
+def _coerce_thinking_level(value: object) -> ThinkingLevel:
+    if isinstance(value, ThinkingLevel):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return ThinkingLevel(value)
+    label = str(value).strip().upper()
+    if label in ThinkingLevel.__members__:
+        return ThinkingLevel[label]
+    raise ValueError(f"Unsupported thinking_level: {value!r}")
+
+
+def _coerce_media_resolution(value: object) -> int:
+    if isinstance(value, MediaResolution):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    return int(MediaResolution[str(value).strip().upper()])
+
+
+def _coerce_image_output_mode(value: object) -> AistudioImageOutputMode | list[int]:
+    if isinstance(value, AistudioImageOutputMode):
+        return value
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        output_type = ImageOutputType(
+            int(value.get("output_type", ImageOutputType.IMAGE))
+        )
+        include_text = bool(value.get("include_text"))
+        return AistudioImageOutputMode(
+            output_type=output_type, include_text=include_text
+        )
+    label = str(value).strip().lower()
+    if label == "text_and_image":
+        return AistudioImageOutputMode.text_and_image()
+    if label == "image_only":
+        return AistudioImageOutputMode.image_only()
+    raise ValueError(f"Unsupported image_output_mode: {value!r}")
+
+
+def _coerce_generation_defaults(raw: dict[str, object] | None) -> dict[str, object]:
+    raw = raw or {}
+    coerced: dict[str, object] = {}
+    for key, value in raw.items():
+        if key == "thinking_config" and isinstance(value, dict):
+            raw_level = value.get(
+                "level", value.get("thinkingLevel", value.get("thinking_level"))
+            )
+            raw_budget = value.get(
+                "budget", value.get("thinkingBudget", value.get("thinking_budget"))
+            )
+            raw_mode = value.get("mode")
+            level = _coerce_thinking_level(raw_level) if raw_level is not None else None
+            budget = (
+                int(str(raw_budget))
+                if raw_budget is not None and not isinstance(raw_budget, bool)
+                else None
+            )
+            if level is not None or budget is not None or raw_mode is not None:
+                mode = (
+                    int(str(raw_mode))
+                    if raw_mode is not None and not isinstance(raw_mode, bool)
+                    else 1
+                )
+                coerced[key] = AistudioThinkingConfig(
+                    level=level, mode=mode, budget=budget
+                ).to_wire()
+            else:
+                coerced[key] = None
+        elif key == "image_output_mode":
+            coerced[key] = (
+                _coerce_image_output_mode(value) if value is not None else None
+            )
+        elif key == "media_resolution":
+            coerced[key] = (
+                _coerce_media_resolution(value) if value is not None else None
+            )
+        else:
+            coerced[key] = value
+    return coerced
+
+
+def _normalize_safety_category(name: object) -> str:
+    return " ".join(
+        str(name).strip().lower().replace("_", " ").replace("-", " ").split()
+    )
+
+
+def _coerce_safety_threshold(value: object) -> int:
+    threshold = int(str(value))
+    if threshold < 1 or threshold > 5:
+        raise ValueError(f"Unsupported safety threshold: {value!r}")
+    return threshold
+
+
+def _coerce_safety_settings(raw: object) -> tuple[tuple[object, ...], ...] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        normalized = {
+            _normalize_safety_category(name): _coerce_safety_threshold(value)
+            for name, value in raw.items()
+        }
+        supported = {name for name, _ in _SAFETY_CATEGORY_ORDER}
+        unknown = [name for name in normalized if name not in supported]
+        if unknown:
+            raise ValueError(f"Unsupported safety categories: {', '.join(unknown)}")
+        return tuple(
+            (None, None, category, normalized[name])
+            for name, category in _SAFETY_CATEGORY_ORDER
+            if name in normalized
+        )
+    if isinstance(raw, (list, tuple)):
+        settings = []
+        for item in raw:
+            if not isinstance(item, (list, tuple)) or len(item) < 4:
+                raise ValueError(f"Unsupported safety setting entry: {item!r}")
+            settings.append(
+                (None, None, int(item[2]), _coerce_safety_threshold(item[3]))
+            )
+        return tuple(settings)
+    raise ValueError(f"Unsupported safety_settings: {raw!r}")
+
+
+def _defaults_from_mapping(raw: dict[str, object] | None) -> ModelDefaults:
+    raw_dict = raw or {}
+    raw_default_tools = raw_dict.get("default_tools")
+    default_tools_list = (
+        raw_default_tools if isinstance(raw_default_tools, (list, tuple)) else ()
+    )
+    raw_gen_defaults = raw_dict.get("generation_config_defaults")
+    gen_defaults = raw_gen_defaults if isinstance(raw_gen_defaults, dict) else None
+    raw_clear_indexes = raw_dict.get("clear_generation_config_indexes")
+    clear_indexes_list = (
+        raw_clear_indexes if isinstance(raw_clear_indexes, (list, tuple)) else ()
+    )
+    return ModelDefaults(
+        is_image_model=bool(raw_dict.get("is_image_model", False)),
+        default_tools=tuple(str(x) for x in default_tools_list),
+        generation_config_defaults=_coerce_generation_defaults(gen_defaults),
+        clear_generation_config_indexes=tuple(int(str(v)) for v in clear_indexes_list),
+        safety_settings=_coerce_safety_settings(raw_dict.get("safety_settings")),
+        disable_safety_settings=bool(raw_dict.get("disable_safety_settings", False)),
+        drop_unsupported_params=bool(raw_dict.get("drop_unsupported_params", False)),
+        specified_fields=frozenset(raw_dict.keys()),
+    )
+
+
+def _profile_from_mapping(raw: dict[str, object]) -> ModelProfile:
+    raw_match = raw.get("match")
+    match: dict[str, object] = raw_match if isinstance(raw_match, dict) else {}
+    raw_exact = match.get("exact")
+    exact_list = raw_exact if isinstance(raw_exact, (list, tuple)) else ()
+    raw_prefixes = match.get("prefixes")
+    prefixes_list = raw_prefixes if isinstance(raw_prefixes, (list, tuple)) else ()
+    raw_contains = match.get("contains")
+    contains_list = raw_contains if isinstance(raw_contains, (list, tuple)) else ()
+    return ModelProfile(
+        name=str(raw.get("name", "unnamed")),
+        exact=tuple(_normalize_model_name(str(v)) for v in exact_list),
+        prefixes=tuple(_normalize_model_name(str(v)) for v in prefixes_list),
+        contains=tuple(str(v).strip().lower() for v in contains_list),
+        defaults=_defaults_from_mapping(raw),
+    )
+
+
+def _default_config() -> dict[str, object]:
+    return {
+        "logging": {
+            "level": "INFO",
+            "dump_requests": False,
+        },
+        "model_defaults": {
+            "drop_unsupported_params": False,
+            "profiles": [
+                {
+                    "name": "image_models",
+                    "match": {"contains": ["image", "imagen"]},
+                    "is_image_model": True,
+                    "disable_safety_settings": True,
+                },
+                {
+                    "name": "video_models",
+                    "match": {
+                        "prefixes": ["veo-"],
+                        "contains": ["veo", "omni", "video"],
+                    },
+                    "disable_safety_settings": True,
+                },
+                {
+                    "name": "gemma_models",
+                    "match": {"prefixes": ["gemma-"]},
+                    "safety_settings": {
+                        "Harassment": 5,
+                        "Hate": 5,
+                        "Sexually Explicit": 5,
+                        "Dangerous Content": 5,
+                    },
+                },
+                {
+                    "name": "gemini_models",
+                    "match": {"prefixes": ["gemini-"]},
+                    "safety_settings": {
+                        "Harassment": 5,
+                        "Hate": 5,
+                        "Sexually Explicit": 5,
+                        "Dangerous Content": 5,
+                    },
+                    "drop_unsupported_params": True,
+                },
+            ],
+            "models": {},
+        },
+        "rotator": {
+            "max_retries": 5,
+            "strategy": "sticky",
+            "stickiness_bonus": 400.0,
+            "stickiness_threshold": 0.8,
+            "drip_penalty": 500.0,
+            "tier_weights": {
+                "Free": 0.0,
+                "Plus": 0.5,
+                "Pro": 1.0,
+                "Ultra": 2.0,
+                "Ultra_20X": 3.0,
+            },
+            "cooldowns": {
+                "rate_limited_short": 60,
+                "rate_limited_drip": 300,
+                "rate_limited_drip_extended": 600,
+            },
+        },
+        "paid_model_rules": {
+            "ultra_required": {
+                "contains": ["veo", "ultra", "omni", "carbon"],
+                "required_tiers": ["Ultra", "Ultra_20X"],
+            },
+            "pro_required": {
+                "contains": ["argon", "image", "imagen", "gemini-3.1-pro"],
+                "required_tiers": ["Pro", "Ultra", "Ultra_20X"],
+            },
+        },
+        "tier_quotas": {
+            "Free": {
+                "hydrogen_models": {
+                    "match": {"contains": ["hydrogen"]},
+                    "daily_limit": 50,
+                    "daily_token_limit": 10_000_000,
+                },
+                "flash_models": {
+                    "match": {"contains": ["flash"]},
+                    "daily_limit": 50,
+                    "daily_token_limit": 5_000_000,
+                },
+                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 10},
+                "default_limit": 20,
+            },
+            "Plus": {
+                "hydrogen_models": {
+                    "match": {"contains": ["hydrogen"]},
+                    "daily_limit": 50,
+                    "daily_token_limit": 10_000_000,
+                },
+                "flash_models": {
+                    "match": {"contains": ["flash"]},
+                    "daily_limit": 100,
+                    "daily_token_limit": 10_000_000,
+                },
+                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 30},
+                "default_limit": 50,
+            },
+            "Pro": {
+                "hydrogen_models": {
+                    "match": {"contains": ["hydrogen"]},
+                    "daily_limit": 100,
+                    "daily_token_limit": 25_000_000,
+                },
+                "argon_models": {
+                    "match": {"contains": ["argon"]},
+                    "daily_limit": 50,
+                    "daily_token_limit": 15_000_000,
+                },
+                "image_models": {
+                    "match": {"contains": ["image", "imagen"]},
+                    "daily_limit": 50,
+                },
+                "flash_models": {
+                    "match": {"contains": ["flash"]},
+                    "daily_limit": 150,
+                    "daily_token_limit": 25_000_000,
+                },
+                "pro_models": {
+                    "match": {"contains": ["pro"]},
+                    "daily_limit": 50,
+                    "daily_token_limit": 13_000_000,
+                },
+                "default_limit": 50,
+            },
+            "Ultra": {
+                "hydrogen_models": {
+                    "match": {"contains": ["hydrogen"]},
+                    "daily_limit": 200,
+                },
+                "argon_models": {
+                    "match": {"contains": ["argon"]},
+                    "daily_limit": 200,
+                },
+                "carbon_models": {
+                    "match": {"contains": ["carbon"]},
+                    "daily_limit": 200,
+                },
+                "image_models": {
+                    "match": {"contains": ["image", "imagen"]},
+                    "daily_limit": 200,
+                },
+                "video_models": {"match": {"contains": ["veo"]}, "daily_limit": 50},
+                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 200},
+                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 100},
+                "default_limit": 200,
+            },
+            "Ultra_20X": {
+                "hydrogen_models": {
+                    "match": {"contains": ["hydrogen"]},
+                    "daily_limit": 200,
+                },
+                "argon_models": {
+                    "match": {"contains": ["argon"]},
+                    "daily_limit": 200,
+                },
+                "carbon_models": {
+                    "match": {"contains": ["carbon"]},
+                    "daily_limit": 200,
+                },
+                "image_models": {
+                    "match": {"contains": ["image", "imagen"]},
+                    "daily_limit": 200,
+                },
+                "video_models": {"match": {"contains": ["veo"]}, "daily_limit": 50},
+                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 200},
+                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 100},
+                "default_limit": 200,
+            },
+            "overrides": {},
+        },
+        "account_presets": [
+            {
+                "id": "preset_all",
+                "name": "全部启用 (最大并发)",
+                "description": "激活所有可用账号，提供最充沛的并发与负载池",
+                "action": "enable_all",
+                "is_system": True,
+            },
+            {
+                "id": "preset_paid_only",
+                "name": "纯高阶付费池 (Plus/Pro/Ultra)",
+                "description": "仅激活具有付费权益的账号，全力保障高阶模型调用",
+                "action": "filter_tier",
+                "target_tiers": ["Plus", "Pro", "Ultra", "Ultra_20X"],
+                "is_system": True,
+            },
+            {
+                "id": "preset_ultra_only",
+                "name": "旗舰专属池 (Ultra 独占)",
+                "description": "仅激活 Ultra 顶级算力账号，保障最顶尖模型调用",
+                "action": "filter_tier",
+                "target_tiers": ["Ultra", "Ultra_20X"],
+                "is_system": True,
+            },
+            {
+                "id": "preset_free_only",
+                "name": "纯免费节能池 (Free)",
+                "description": "仅激活 Free 等级账号，用于日常普通模型测试",
+                "action": "filter_tier",
+                "target_tiers": ["Free"],
+                "is_system": True,
+            },
+            {
+                "id": "preset_production",
+                "name": "生产专属集群 (Production)",
+                "description": "仅激活 group 标记为 production 的核心业务账号",
+                "action": "filter_group",
+                "target_groups": ["production"],
+                "is_system": True,
+            },
+        ],
+    }
+
+
+_CONFIG_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
+_API_KEYS_CACHE: dict[str, tuple[float, frozenset[str], list[dict[str, str]]]] = {}
+
+
+def invalidate_config_cache() -> None:
+    """Clear in-memory configuration and API keys cache."""
+    _CONFIG_CACHE.clear()
+    _API_KEYS_CACHE.clear()
+    _compiled_profiles.cache_clear()
+    _compiled_model_overrides.cache_clear()
+
+
+def _load_yaml_config(config_path: Path) -> dict[str, object]:
+    if not config_path.exists():
+        return _default_config()
+
+    path_key = str(config_path.resolve())
+    try:
+        mtime = config_path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+
+    cached = _CONFIG_CACHE.get(path_key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(loaded, dict):
+        loaded = {}
+    merged: dict[str, object] = _default_config()
+    merged.update(loaded)
+    raw_merged_defaults = merged.get("model_defaults")
+    raw_loaded_defaults = loaded.get("model_defaults")
+    if isinstance(raw_merged_defaults, dict) and isinstance(raw_loaded_defaults, dict):
+        def_config = _default_config()
+        def_md = def_config.get("model_defaults")
+        merged_model_defaults = dict(def_md if isinstance(def_md, dict) else {})
+        merged_model_defaults.update(raw_loaded_defaults)
+        merged["model_defaults"] = merged_model_defaults
+    _CONFIG_CACHE[path_key] = (mtime, merged)
+    return merged
+
+
+@lru_cache(maxsize=8)
+def _compiled_profiles(config_path: str) -> tuple[ModelProfile, ...]:
+    config = _load_yaml_config(Path(config_path))
+    raw_md = config.get("model_defaults")
+    model_defaults = raw_md if isinstance(raw_md, dict) else {}
+    raw_profiles = model_defaults.get("profiles")
+    profiles_list = raw_profiles if isinstance(raw_profiles, list) else []
+    return tuple(
+        _profile_from_mapping(item) for item in profiles_list if isinstance(item, dict)
+    )
+
+
+@lru_cache(maxsize=8)
+def _compiled_model_overrides(config_path: str) -> dict[str, ModelDefaults]:
+    config = _load_yaml_config(Path(config_path))
+    raw_md = config.get("model_defaults")
+    model_defaults = raw_md if isinstance(raw_md, dict) else {}
+    raw_models = model_defaults.get("models")
+    models_dict = raw_models if isinstance(raw_models, dict) else {}
+    overrides: dict[str, ModelDefaults] = {}
+    for model_name, raw_defaults in models_dict.items():
+        overrides[_normalize_model_name(str(model_name))] = _defaults_from_mapping(
+            raw_defaults if isinstance(raw_defaults, dict) else {}
+        )
+    return overrides
+
+
+def resolve_model_defaults(
+    model: str, *, config_path: str | os.PathLike[str] | None = None
+) -> ModelDefaults:
+    normalized = _normalize_model_name(model)
+    resolved_path = str(_resolve_config_path(config_path))
+    config = _load_yaml_config(Path(resolved_path))
+    raw_md = config.get("model_defaults")
+    global_drop = False
+    if isinstance(raw_md, dict) and "drop_unsupported_params" in raw_md:
+        global_drop = bool(raw_md["drop_unsupported_params"])
+    elif "drop_unsupported_params" in config:
+        global_drop = bool(config["drop_unsupported_params"])
+
+    profiles = _compiled_profiles(resolved_path)
+    resolved = ModelDefaults(drop_unsupported_params=global_drop)
+    for profile in profiles:
+        if profile.matches(normalized):
+            resolved = resolved.merged(profile.defaults)
+    override = _compiled_model_overrides(resolved_path).get(normalized)
+    if override is not None:
+        resolved = resolved.overridden(override)
+
+    if resolved.is_image_model:
+        allowed = {"google_search", "image_search", "google_search_and_image_search"}
+        filtered = tuple(t for t in resolved.default_tools if t in allowed)
+        if filtered != resolved.default_tools:
+            from dataclasses import replace
+
+            resolved = replace(resolved, default_tools=filtered)
+
+    return resolved
+
+
+def get_configured_api_key_items(
+    config_path: str | os.PathLike[str] | None = None,
+) -> list[dict[str, str]]:
+    """获取 config.yaml 中配置的结构化 API Key 列表（含备注名与创建时间）。"""
+    resolved_path = _resolve_config_path(config_path)
+    path_key = str(resolved_path.resolve())
+    try:
+        mtime = resolved_path.stat().st_mtime if resolved_path.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+
+    cached = _API_KEYS_CACHE.get(path_key)
+    if cached is not None and cached[0] == mtime:
+        return list(cached[2])
+
+    config = _load_yaml_config(resolved_path)
+    raw_keys = config.get("api_keys")
+    items: list[dict[str, str]] = []
+    if isinstance(raw_keys, list):
+        for k in raw_keys:
+            if isinstance(k, dict):
+                key_val = str(k.get("key") or "").strip()
+                name_val = str(k.get("name") or "API Key").strip()
+                created_val = str(k.get("created_at") or "").strip()
+                if key_val:
+                    items.append(
+                        {"key": key_val, "name": name_val, "created_at": created_val}
+                    )
+            elif isinstance(k, str) and k.strip():
+                items.append({"key": k.strip(), "name": "API Key", "created_at": ""})
+    elif isinstance(raw_keys, str):
+        for line in raw_keys.splitlines():
+            for part in line.split(","):
+                s = part.strip()
+                if s:
+                    items.append({"key": s, "name": "API Key", "created_at": ""})
+
+    keys_set = frozenset(item["key"] for item in items if item.get("key"))
+    _API_KEYS_CACHE[path_key] = (mtime, keys_set, items)
+    return items
+
+
+def get_configured_api_keys(
+    config_path: str | os.PathLike[str] | None = None,
+) -> frozenset[str]:
+    """获取 config.yaml 中配置的所有有效 API Key 集合。"""
+    resolved_path = _resolve_config_path(config_path)
+    path_key = str(resolved_path.resolve())
+    try:
+        mtime = resolved_path.stat().st_mtime if resolved_path.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+
+    cached = _API_KEYS_CACHE.get(path_key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    items = get_configured_api_key_items(config_path)
+    return frozenset(item["key"] for item in items if item.get("key"))
+
+
+def get_configured_logging_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml 中配置的 logging 设置。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_logging = config.get("logging")
+    if isinstance(raw_logging, dict):
+        return {
+            "level": str(raw_logging.get("level") or "INFO").strip().upper(),
+            "dump_requests": bool(raw_logging.get("dump_requests", False)),
+            "dump_to_file": bool(raw_logging.get("dump_to_file", False)),
+            "dump_to_file_configured": "dump_to_file" in raw_logging,
+            "dump_dir": str(raw_logging.get("dump_dir") or "").strip(),
+        }
+    return {
+        "level": "INFO",
+        "dump_requests": False,
+        "dump_to_file": False,
+        "dump_to_file_configured": False,
+        "dump_dir": "",
+    }
+
+
+def update_configured_logging_settings(
+    level: str | None = None,
+    dump_requests: bool | None = None,
+    dump_to_file: bool | None = None,
+    dump_dir: str | None = None,
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """更新 config.yaml 中的 logging 设置并刷新缓存。"""
+    resolved_path = _resolve_config_path(config_path)
+    content = (
+        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+    )
+    parsed = yaml.safe_load(content) or {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    raw_logging = parsed.get("logging")
+    logging_dict = dict(raw_logging) if isinstance(raw_logging, dict) else {}
+    if level is not None:
+        logging_dict["level"] = level.strip().upper()
+    if dump_requests is not None:
+        logging_dict["dump_requests"] = dump_requests
+    if dump_to_file is not None:
+        logging_dict["dump_to_file"] = dump_to_file
+    if dump_dir is not None:
+        logging_dict["dump_dir"] = dump_dir
+
+    parsed["logging"] = logging_dict
+    resolved_path.write_text(
+        yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    invalidate_config_cache()
+    return logging_dict
+
+
+# ─── 订阅层级每日软额度 (Tier Quotas) 与预设方案 (Presets) ───
+def get_configured_tier_quotas(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml 中配置的订阅层级软额度规则，若缺失则安全回退至系统默认配置。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_quotas = config.get("tier_quotas")
+    if isinstance(raw_quotas, dict):
+        return raw_quotas
+    def_quotas = _default_config().get("tier_quotas")
+    if isinstance(def_quotas, dict):
+        return def_quotas
+    return {}
+
+
+def _parse_positive_int(raw: object, fallback: int) -> int:
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        val = int(str(raw))
+        return val if val > 0 else fallback
+    except (ValueError, TypeError):
+        return fallback
+
+
+def _parse_optional_positive_int(
+    raw: object, fallback: int | None = None
+) -> int | None:
+    if raw is None or isinstance(raw, bool):
+        return fallback
+    try:
+        val = int(str(raw))
+        return val if val > 0 else fallback
+    except (ValueError, TypeError):
+        return fallback
+
+
+def resolve_tier_quota_limits(
+    tier: str | None,
+    model: str | None,
+    config_path: str | os.PathLike[str] | None = None,
+) -> TierQuotaLimits:
+    """计算指定账号层级在目标模型上的每日请求次数与 Token 软额度限制。"""
+    normalized_model = _normalize_model_name(model) if model else ""
+    quotas = get_configured_tier_quotas(config_path)
+
+    # 1. 解析层级基础规则
+    clean_tier = (tier or "Free").strip()
+    if clean_tier not in quotas or clean_tier == "overrides":
+        matched_key = None
+        for k in quotas:
+            if k != "overrides" and k.lower() == clean_tier.lower():
+                matched_key = k
+                break
+        if matched_key:
+            clean_tier = matched_key
+        elif "Free" in quotas:
+            clean_tier = "Free"
+        else:
+            clean_tier = next((k for k in quotas if k != "overrides"), "Free")
+
+    tier_rules = quotas.get(clean_tier)
+    base_limits = TierQuotaLimits(daily_limit=20, daily_token_limit=None)
+    if isinstance(tier_rules, dict):
+        default_limit = _parse_positive_int(tier_rules.get("default_limit"), 20)
+        default_token_limit = _parse_optional_positive_int(
+            tier_rules.get("default_token_limit")
+        )
+        base_limits = TierQuotaLimits(
+            daily_limit=default_limit,
+            daily_token_limit=default_token_limit,
+        )
+        if normalized_model:
+            for rule_key, rule_data in tier_rules.items():
+                if rule_key in (
+                    "default_limit",
+                    "default_token_limit",
+                ) or not isinstance(rule_data, dict):
+                    continue
+                raw_match = rule_data.get("match")
+                if isinstance(raw_match, dict):
+                    contains = [
+                        str(c).lower()
+                        for c in (raw_match.get("contains") or [])
+                        if isinstance(c, str)
+                    ]
+                    prefixes = [
+                        str(p).lower()
+                        for p in (raw_match.get("prefixes") or [])
+                        if isinstance(p, str)
+                    ]
+                    exact = [
+                        _normalize_model_name(str(e))
+                        for e in (raw_match.get("exact") or [])
+                        if isinstance(e, str)
+                    ]
+                    if (
+                        (exact and normalized_model in exact)
+                        or any(normalized_model.startswith(p) for p in prefixes)
+                        or any(c in normalized_model for c in contains)
+                    ):
+                        rule_daily = _parse_positive_int(
+                            rule_data.get("daily_limit"), default_limit
+                        )
+                        rule_token = (
+                            _parse_optional_positive_int(
+                                rule_data.get("daily_token_limit")
+                            )
+                            if "daily_token_limit" in rule_data
+                            else default_token_limit
+                        )
+                        base_limits = TierQuotaLimits(
+                            daily_limit=rule_daily,
+                            daily_token_limit=rule_token,
+                        )
+                        break
+
+    # 2. 精确模型覆盖 overrides (优先级最高，支持单数字或 {daily_limit, daily_token_limit})
+    raw_overrides = quotas.get("overrides")
+    if normalized_model and isinstance(raw_overrides, dict):
+        for m_key, val in raw_overrides.items():
+            if _normalize_model_name(str(m_key)) == normalized_model:
+                if isinstance(val, dict):
+                    ov_daily = (
+                        _parse_positive_int(
+                            val.get("daily_limit"), base_limits.daily_limit
+                        )
+                        if "daily_limit" in val
+                        else base_limits.daily_limit
+                    )
+                    ov_token = (
+                        _parse_optional_positive_int(val.get("daily_token_limit"))
+                        if "daily_token_limit" in val
+                        else base_limits.daily_token_limit
+                    )
+                    return TierQuotaLimits(
+                        daily_limit=ov_daily,
+                        daily_token_limit=ov_token,
+                    )
+                ov_scalar = _parse_optional_positive_int(val)
+                if ov_scalar is not None:
+                    return TierQuotaLimits(
+                        daily_limit=ov_scalar,
+                        daily_token_limit=base_limits.daily_token_limit,
+                    )
+
+    return base_limits
+
+
+def resolve_tier_quota(
+    tier: str | None,
+    model: str | None,
+    config_path: str | os.PathLike[str] | None = None,
+) -> int:
+    """计算指定账号层级在目标模型上的每日软额度限制（仅用于轮询打分权重，超额绝不禁用账号）。"""
+    return resolve_tier_quota_limits(tier, model, config_path=config_path).daily_limit
+
+
+def get_default_config_sections() -> dict[str, object]:
+    """返回内置默认配置的核心可配置区块，供前端重置与表单初始化使用。"""
+    defaults = _default_config()
+    return {
+        "model_defaults": defaults.get("model_defaults", {}),
+        "tier_quotas": defaults.get("tier_quotas", {}),
+        "paid_model_rules": defaults.get("paid_model_rules", {}),
+        "rotator": defaults.get("rotator", {}),
+    }
+
+
+def validate_config_sections(parsed: dict[str, object]) -> None:
+    """校验关键配置段结构合法性，防止非法数值或类型写入 config.yaml。"""
+
+    def _is_pos_int(v: object) -> bool:
+        return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+    def _is_nonneg_num(v: object) -> bool:
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0
+
+    if "tier_quotas" in parsed and parsed["tier_quotas"] is not None:
+        tq = parsed["tier_quotas"]
+        if not isinstance(tq, dict):
+            raise ValueError("tier_quotas 必须是字典结构")
+        for tier_key, tier_val in tq.items():
+            if tier_key == "overrides":
+                if tier_val is None:
+                    continue
+                if not isinstance(tier_val, dict):
+                    raise ValueError("tier_quotas.overrides 必须是字典结构")
+                for ov_k, ov_v in tier_val.items():
+                    if isinstance(ov_v, dict):
+                        if (
+                            "daily_limit" in ov_v
+                            and ov_v["daily_limit"] is not None
+                            and not _is_pos_int(ov_v["daily_limit"])
+                        ):
+                            raise ValueError(
+                                f"tier_quotas.overrides.{ov_k}.daily_limit 必须是正整数"
+                            )
+                        if (
+                            "daily_token_limit" in ov_v
+                            and ov_v["daily_token_limit"] is not None
+                            and not _is_pos_int(ov_v["daily_token_limit"])
+                        ):
+                            raise ValueError(
+                                f"tier_quotas.overrides.{ov_k}.daily_token_limit 必须是正整数或 null"
+                            )
+                    elif not _is_pos_int(ov_v):
+                        raise ValueError(
+                            f"tier_quotas.overrides.{ov_k} 必须是正整数或包含 daily_limit 的对象"
+                        )
+                continue
+            if not isinstance(tier_val, dict):
+                raise ValueError(f"tier_quotas.{tier_key} 必须是字典结构")
+            if (
+                "default_limit" in tier_val
+                and tier_val["default_limit"] is not None
+                and not _is_pos_int(tier_val["default_limit"])
+            ):
+                raise ValueError(f"tier_quotas.{tier_key}.default_limit 必须是正整数")
+            if (
+                "default_token_limit" in tier_val
+                and tier_val["default_token_limit"] is not None
+                and not _is_pos_int(tier_val["default_token_limit"])
+            ):
+                raise ValueError(
+                    f"tier_quotas.{tier_key}.default_token_limit 必须是正整数或 null"
+                )
+            for rule_key, rule_val in tier_val.items():
+                if rule_key in ("default_limit", "default_token_limit"):
+                    continue
+                if not isinstance(rule_val, dict):
+                    raise ValueError(
+                        f"tier_quotas.{tier_key}.{rule_key} 必须是规则对象"
+                    )
+                if "daily_limit" in rule_val and not _is_pos_int(
+                    rule_val["daily_limit"]
+                ):
+                    raise ValueError(
+                        f"tier_quotas.{tier_key}.{rule_key}.daily_limit 必须是正整数"
+                    )
+                if (
+                    "daily_token_limit" in rule_val
+                    and rule_val["daily_token_limit"] is not None
+                    and not _is_pos_int(rule_val["daily_token_limit"])
+                ):
+                    raise ValueError(
+                        f"tier_quotas.{tier_key}.{rule_key}.daily_token_limit 必须是正整数或 null"
+                    )
+
+    if "paid_model_rules" in parsed and parsed["paid_model_rules"] is not None:
+        pmr = parsed["paid_model_rules"]
+        if not isinstance(pmr, dict):
+            raise ValueError("paid_model_rules 必须是字典结构")
+        for r_key, r_val in pmr.items():
+            if not isinstance(r_val, dict):
+                raise ValueError(f"paid_model_rules.{r_key} 必须是字典结构")
+            req_tiers = r_val.get("required_tiers")
+            if not isinstance(req_tiers, list) or not all(
+                isinstance(t, str) and t.strip() for t in req_tiers
+            ):
+                raise ValueError(
+                    f"paid_model_rules.{r_key}.required_tiers 必须是非空字符串列表"
+                )
+
+    if "rotator" in parsed and parsed["rotator"] is not None:
+        rot = parsed["rotator"]
+        if not isinstance(rot, dict):
+            raise ValueError("rotator 必须是字典结构")
+        for num_field in (
+            "max_retries",
+            "stickiness_bonus",
+            "stickiness_threshold",
+            "drip_penalty",
+        ):
+            if num_field in rot and not _is_nonneg_num(rot[num_field]):
+                raise ValueError(f"rotator.{num_field} 必须是非负数字")
+        if "stickiness_threshold" in rot:
+            thresh = float(str(rot["stickiness_threshold"]))
+            if thresh > 1.0:
+                raise ValueError("rotator.stickiness_threshold 必须在 0.0 ~ 1.0 之间")
+        if "tier_weights" in rot:
+            tw = rot["tier_weights"]
+            if not isinstance(tw, dict) or not all(
+                isinstance(v, (int, float)) and not isinstance(v, bool)
+                for v in tw.values()
+            ):
+                raise ValueError("rotator.tier_weights 必须是数字映射字典")
+        if "cooldowns" in rot:
+            cds = rot["cooldowns"]
+            if not isinstance(cds, dict) or not all(
+                _is_nonneg_num(v) for v in cds.values()
+            ):
+                raise ValueError("rotator.cooldowns 必须是非负数字映射字典")
+
+
+def get_configured_presets(
+    config_path: str | os.PathLike[str] | None = None,
+) -> list[dict[str, object]]:
+    """获取 config.yaml 中配置的预设方案列表。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_presets = config.get("account_presets")
+    if isinstance(raw_presets, list):
+        return [p for p in raw_presets if isinstance(p, dict)]
+    def_presets = _default_config().get("account_presets")
+    if isinstance(def_presets, list):
+        return [p for p in def_presets if isinstance(p, dict)]
+    return []
+
+
+def get_configured_rotator_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml 中配置的 rotator 调度策略、打分权重与冷却时间，若缺失安全回退至系统默认配置。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_rotator = config.get("rotator")
+    if isinstance(raw_rotator, dict):
+        return raw_rotator
+    def_rotator = _default_config().get("rotator")
+    if isinstance(def_rotator, dict):
+        return def_rotator
+    return {}
+
+
+def get_configured_paid_model_rules(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml 中配置的 paid_model_rules 付费模型判定与准入规则，若缺失安全回退至系统默认配置。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_rules = config.get("paid_model_rules")
+    if isinstance(raw_rules, dict):
+        return raw_rules
+    def_rules = _default_config().get("paid_model_rules")
+    if isinstance(def_rules, dict):
+        return def_rules
+    return {}
