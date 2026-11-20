@@ -46,6 +46,29 @@
   .umodel { font-size: 14px; overflow-wrap: anywhere; }
   .umeta { font-size: 12px; opacity: .8; margin-top: 2px; overflow-wrap: anywhere; }
   .umeta .seg { white-space: nowrap; }
+  /* 用量日志 A 版卡片流 */
+  .ustats { display: flex; gap: 8px; margin: 10px 0 2px; }
+  .ustat { flex: 1 1 0; text-align: center; background: rgba(255,233,214,.35); border: 1px solid #f3ddc8; border-radius: 14px; padding: 8px 4px; }
+  .ustat b { display: block; font-size: 22px; line-height: 1.2; color: #5b3a29; }
+  .ustat span { display: block; font-size: 12px; opacity: .75; margin-top: 1px; }
+  .ustat.ok b { color: #27ae60; }
+  .ustat.fail b { color: #e74c3c; }
+  .uchips { display: flex; gap: 8px; overflow-x: auto; -webkit-overflow-scrolling: touch; padding: 2px 2px 8px; margin-top: 8px; }
+  .uchip { flex: 0 0 auto; display: flex; flex-direction: column; gap: 1px; background: #fffdf9; border: 1px solid #eed3b8; border-radius: 12px; padding: 6px 10px; }
+  .uchip .um { font-family: monospace; font-size: 12px; font-weight: 700; color: #5b3a29; overflow-wrap: anywhere; }
+  .uchip .uc { font-size: 11px; opacity: .8; white-space: nowrap; }
+  .uchip .uc b { color: #ff7e5f; }
+  .ucard { position: relative; overflow: hidden; background: #fffdf9; border: 1px solid #f3ddc8; border-radius: 14px; padding: 10px 12px 10px 16px; margin-bottom: 8px; }
+  .ucard::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 5px; background: #2ecc71; }
+  .ucard.fail::before { background: #e74c3c; }
+  .ucard .umodel { font-weight: 700; }
+  .urow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 5px; font-size: 12px; }
+  .upill { font-size: 11px; line-height: 1.7; padding: 0 8px; border-radius: 99px; border: 1px solid; white-space: nowrap; }
+  .upill.ch { border-color: #ffb08e; color: #d96f47; background: rgba(255,158,122,.12); }
+  .upill.ok { border-color: #a9dfc5; color: #1e8449; background: rgba(46,204,113,.10); }
+  .upill.fail { border-color: #f5b7b1; color: #c0392b; background: rgba(231,76,60,.08); }
+  .udur { margin-left: auto; opacity: .75; }
+  .uerr { margin-top: 7px; background: rgba(231,76,60,.07); border: 1px solid rgba(231,76,60,.25); color: #a93226; border-radius: 8px; padding: 6px 8px; font-size: 12px; overflow-wrap: anywhere; }
   .tabbar { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; }
   .tabbar button { background: rgba(255,255,255,.7); color: #5b3a29; border: 1px solid #eed3b8; box-shadow: none; }
   .tabbar button.active { background: linear-gradient(135deg, #ff9e7a, #ff7e5f); color: #fff; border-color: #ff7e5f; }
@@ -161,12 +184,10 @@
     <select id="usageDay"></select>
     <button class="secondary" id="usageRefresh">刷新用量</button>
   </div>
-  <p id="usageSummary" style="font-size:15px; margin:10px 0 6px">未查询</p>
+  <div id="usageSummary"></div>
   <div id="usageModels"></div>
-  <p class="hint" style="margin-top:10px">流水明细（几点几分用了什么，最新在前，最多 300 条）：</p>
+  <p class="hint" style="margin-top:10px">流水明细（几点几分用了什么，最新在前，最多 300 条；失败原因直接写在卡片里）：</p>
   <div id="usageEntries"></div>
-  <p class="hint" style="margin-top:10px">失败记录（最新在前，最多 50 条）：</p>
-  <div id="usageErrors"></div>
   <p id="usageMsg"></p>
 </div>
 
@@ -594,7 +615,7 @@ $('poolAdd').onclick = async () => {
 };
 
 // ---------------------------------------------------------------------------
-// 今日用量：日期下拉（有数据的日期）+ 汇总行 + 按模型表 + 流水明细 + 失败列表
+// 今日用量：日期下拉（有数据的日期）+ 统计块 + 按模型 chips + 流水卡片（失败原因并入卡片）
 // ---------------------------------------------------------------------------
 function fmtTimeSH(ts) {
   return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
@@ -631,25 +652,20 @@ async function loadUsage() {
 function renderUsage(d) {
   const days = Array.isArray(d.days) && d.days.length ? d.days : [d.day];
   $('usageDay').innerHTML = days.map((dy) => `<option value="${esc(dy)}"${dy === d.day ? ' selected' : ''}>${esc(dy)}</option>`).join('');
-  $('usageSummary').textContent = `共 ${d.total} 条 · 成功 ${d.ok} · 失败 ${d.fail}`;
+  $('usageSummary').innerHTML = `<div class="ustats"><div class="ustat"><b>${d.total || 0}</b><span>总数</span></div><div class="ustat ok"><b>${d.ok || 0}</b><span>成功</span></div><div class="ustat fail"><b>${d.fail || 0}</b><span>失败</span></div></div>`;
   $('usageModels').innerHTML = (d.byModel && d.byModel.length)
-    ? `<table><tr><th>模型</th><th class="num">条数</th><th class="num">成功</th><th class="num">失败</th></tr>${d.byModel.map((m) => `<tr><td class="mono wrapany">${esc(m.model)}</td><td class="num">${m.total}</td><td class="num">${m.ok}</td><td class="num">${m.fail}</td></tr>`).join('')}</table>`
+    ? `<div class="uchips">${d.byModel.map((m) => `<div class="uchip"><span class="um">${esc(m.model)}</span><span class="uc"><b>${m.total}</b> 条 · 成功 ${m.ok} · 失败 ${m.fail}</span></div>`).join('')}</div>`
     : '<p class="hint">这一天还没有生成请求。</p>';
   $('usageEntries').innerHTML = (d.entries && d.entries.length)
     ? d.entries.map((e) => {
-        const segs = [
-          `<span class="seg mono">${fmtTimeSH(e.ts)}</span>`,
-          `<span class="seg">${e.channel === 'pggo' ? 'pggo' : 'pg'}</span>`,
-          `<span class="seg">${e.ok ? `成功 ${e.status || ''}` : `失败 ${e.status || ''}`}</span>`,
-        ];
-        if (!e.ok && e.error) segs.push(esc(e.error));
-        segs.push(`<span class="seg mono">${fmtDur(e)}</span>`);
-        return `<div class="uentry"><div class="umodel mono">${esc(e.model)}</div><div class="umeta">${segs.join(' · ')}</div></div>`;
+        const chanPill = `<span class="upill ch">${e.channel === 'pggo' ? '云端' : '挂机'}</span>`;
+        const statusPill = e.ok
+          ? `<span class="upill ok">成功 ${e.status || ''}</span>`
+          : `<span class="upill fail">失败 ${e.status || ''}</span>`;
+        const errBox = (!e.ok && e.error) ? `<div class="uerr">${esc(e.error)}</div>` : '';
+        return `<div class="ucard ${e.ok ? 'ok' : 'fail'}"><div class="umodel mono">${esc(e.model)}</div><div class="urow"><span class="mono">${fmtTimeSH(e.ts)}</span>${chanPill}${statusPill}<span class="udur mono">${fmtDur(e)}</span></div>${errBox}</div>`;
       }).join('')
     : '<p class="hint">当天暂无记录。</p>';
-  $('usageErrors').innerHTML = (d.errors && d.errors.length)
-    ? d.errors.map((e) => `<p class="hint" style="margin:4px 0"><span class="mono">${new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false })}</span> · <span class="mono">${esc(e.model)}</span> · HTTP ${e.status} · ${esc(e.error)}</p>`).join('')
-    : '<p class="hint">这一天没有失败记录。</p>';
   $('usageMsg').textContent = '';
 }
 
