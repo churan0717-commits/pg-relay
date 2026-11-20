@@ -157,6 +157,7 @@
   <p class="hint">订阅自动转成的节点（增删在机场/订阅侧，这里只看和用）。选好要绑定的云端账号，点节点后面的「绑定」，就把该节点设为这个账号的出口代理，<b>立即写入账户生效</b>；「复制」把节点地址拷走，填到别处也能用。</p>
   <label>绑定到账号</label>
   <select id="subAcct" style="width:100%"></select>
+  <p id="subAcctEgress" style="font-size:14px; margin:8px 0 0"></p>
   <div class="row" style="margin-top:10px">
     <button class="secondary" id="subTestBtn" style="padding:6px 14px; font-size:14px">一键测速</button>
     <span class="hint" style="margin:0">测的是各节点到谷歌的连通与延迟，点一下全部测一遍。</span>
@@ -253,6 +254,7 @@ function renderHeadless(h) {
     $('poolAssign').innerHTML = '';
     $('subNodeList').innerHTML = '';
     $('subAcct').innerHTML = '';
+    $('subAcctEgress').textContent = '';
     $('proxyEmail').innerHTML = '<option value="">（默认）未单独绑定的账户</option>';
     return;
   }
@@ -302,7 +304,7 @@ function renderHeadless(h) {
   const px = h.proxies || { default: '', byEmail: {} };
   const parts = [];
   if (px.default) parts.push(`默认：${px.default}`);
-  for (const [em, pv] of Object.entries(px.byEmail || {})) parts.push(`${em}：${pv}`);
+  for (const [em, pv] of Object.entries(px.byEmail || {})) parts.push(pv ? `${em}：${pv}` : `${em}：机房直出（已解绑）`);
   $('proxySaved').textContent = parts.length ? parts.join('；') : '（无）';
   lastHeadless = h;
   renderPool(h);
@@ -361,8 +363,9 @@ function renderPool(h) {
 // ---------------------------------------------------------------------------
 // 订阅节点卡：账号下拉（选项 = 已导入的云端账号，与总览同口径 a.id||a.label）
 // + 节点行（复制地址 / 一键绑定到选中账号，走既有 POST /api/console/pggo/proxy）。
-// 当前绑定徽标：status 里 proxies.byEmail 优先、poolAssignments 次之（与服务端
-// 解析顺序一致），命中的节点行打「当前绑定」。
+// 当前绑定徽标只认真实状态：byEmail 有选中账号的键时以它为准（非空=绑定
+// 该 URL；空值=用户显式解绑、走机房直出，不打徽标），无键时才看
+// poolAssignments。下拉下方另有一行「当前出口」文字，口径与徽标一致。
 // ---------------------------------------------------------------------------
 function renderSubNodes(h) {
   const sel = $('subAcct');
@@ -388,13 +391,30 @@ function renderSubNodes(h) {
   pSel.value = emails.includes(prevProxyEmail) ? prevProxyEmail : '';
   const nodes = poolCache.filter((p) => p.source === 'clash');
   const box = $('subNodeList');
+  // 当前出口只认真实状态：byEmail 里有选中账号的键就以它为准（非空=绑定
+  // 该 URL，空=显式直出），不再回退池分配记录；只有从未在自带代理里单独
+  // 指定过的账号，才用池分配记录表示当前绑定。
+  const byEmail = ((h && h.proxies) || {}).byEmail || {};
+  const asg = (h && h.poolAssignments) || {};
+  const boundUrl = !subAcctSel
+    ? ''
+    : Object.prototype.hasOwnProperty.call(byEmail, subAcctSel)
+      ? (byEmail[subAcctSel] || '')
+      : (asg[subAcctSel] || '');
+  const egressEl = $('subAcctEgress');
+  if (egressEl) {
+    if (!subAcctSel) egressEl.textContent = '';
+    else if (boundUrl) {
+      const hit = nodes.find((p) => p.url === boundUrl);
+      egressEl.textContent = `当前出口：${hit ? (hit.label || boundUrl) : boundUrl}`;
+    } else {
+      egressEl.textContent = '当前出口：机房直出';
+    }
+  }
   if (!nodes.length) {
     box.innerHTML = '<p class="hint">当前没有订阅节点。</p>';
     return;
   }
-  const byEmail = ((h && h.proxies) || {}).byEmail || {};
-  const asg = (h && h.poolAssignments) || {};
-  const boundUrl = subAcctSel ? (byEmail[subAcctSel] || asg[subAcctSel] || '') : '';
   box.innerHTML = nodes.map((p) => `
     <div class="row" data-url="${esc(p.url)}" style="margin:8px 0; padding-bottom:8px; border-bottom:1px dashed #8884">
       <span><b>${esc(p.label || '（无备注）')}</b></span>

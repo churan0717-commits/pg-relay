@@ -756,11 +756,14 @@ async function poolTestAll(entries) {
 }
 
 // 推送导入时选代理：按邮箱绑定 > 默认代理 > 流量池（手工+订阅合并池）。
-// 走池时同一邮箱复用既有分配（账户出口不乱跳）；分配记录指向的 URL
-// 已被移出池时重新分配。返回 { proxy, source }。
+// byEmail 口径：键存在且非空 = 绑定该 URL；键存在但为空字符串 = 用户在
+// 管理台显式解绑（指定直出），直接返回空代理、不再往下走默认/池分配；
+// 键不存在才轮到默认代理与池分配。走池时同一邮箱复用既有分配（账户出口
+// 不乱跳）；分配记录指向的 URL 已被移出池时重新分配。返回 { proxy, source }。
 function pickProxyForEmail(email) {
-  if (email && pggoState.proxies.byEmail[email]) {
-    return { proxy: pggoState.proxies.byEmail[email], source: 'byEmail' };
+  if (email && Object.hasOwn(pggoState.proxies.byEmail, email)) {
+    const bound = pggoState.proxies.byEmail[email] || '';
+    return bound ? { proxy: bound, source: 'byEmail' } : { proxy: '', source: 'direct' };
   }
   if (pggoState.proxies.default) {
     return { proxy: pggoState.proxies.default, source: 'default' };
@@ -2701,7 +2704,7 @@ async function handlePggoAccountAction(req, res, url, action) {
     if (action === 'delete') {
       await hlDeleteAccount(id);
       let changed = false;
-      if (pggoState.proxies.byEmail[id]) { delete pggoState.proxies.byEmail[id]; changed = true; }
+      if (Object.hasOwn(pggoState.proxies.byEmail, id)) { delete pggoState.proxies.byEmail[id]; changed = true; }
       if (pggoState.poolAssignments[id]) { delete pggoState.poolAssignments[id]; changed = true; }
       if (changed) savePggoState();
     } else {
@@ -2936,13 +2939,20 @@ const server = http.createServer(async (req, res) => {
           note: '默认代理已保存，在未单独绑定的账户下次推送/导入时生效。',
         });
       }
-      const prevBinding = pggoState.proxies.byEmail[pEmail] || '';
-      if (pProxy) pggoState.proxies.byEmail[pEmail] = pProxy;
-      else delete pggoState.proxies.byEmail[pEmail];
+      if (pProxy) {
+        pggoState.proxies.byEmail[pEmail] = pProxy;
+      } else {
+        // 解绑 = 显式直出：byEmail 留空字符串占位（键保留，表示「用户明确
+        // 指定直出」，pickProxyForEmail 见键即认、不再回退默认/池分配），
+        // 并清掉该邮箱的池分配记录，避免旧分配被徽标/重推当成当前绑定复活。
+        pggoState.proxies.byEmail[pEmail] = '';
+        if (pggoState.poolAssignments[pEmail]) delete pggoState.poolAssignments[pEmail];
+      }
       savePggoState();
       // 绑定存好后，若该邮箱的账户已导入无头服务，立即把代理同步写进账户
-      // 配置生效（hlSetAccountProxy），不再等下次推送。清除绑定时仅当账户现
-      // 用代理正是被删的这条绑定才同步清掉，避免误洗流量池分配的代理。
+      // 配置生效（hlSetAccountProxy），不再等下次推送。解绑（显式直出）时
+      // 无条件把账户现用代理清掉——无论它来自按邮箱绑定还是池分配，都与
+      // 上面的留痕口径保持一致。
       let appliedToAccount = false;
       let note;
       if (pProxy) {
@@ -2955,16 +2965,16 @@ const server = http.createServer(async (req, res) => {
           : r.reason === 'account_not_found'
             ? '绑定已保存；该邮箱还没有导入账户，将在首次推送时生效。'
             : `绑定已保存，但暂未写入账户（${r.reason}），将在下次推送时生效。`;
-      } else if (prevBinding) {
-        const r = await hlSetAccountProxy(pEmail, '', prevBinding);
+      } else {
+        const r = await hlSetAccountProxy(pEmail, '');
         appliedToAccount = !!r.applied;
         note = r.applied
-          ? '绑定已清除，并已同步清掉账户配置里的代理，立即生效（账户将以新代理重启，下一次请求会短暂预热）。'
+          ? r.unchanged
+            ? '已设为机房直出；该账户当前本来就没有走代理，无需变更。'
+            : '已设为机房直出，并已同步清掉账户配置里的代理，立即生效（账户将以直出重启，下一次请求会短暂预热）。'
           : r.reason === 'account_not_found'
-            ? '绑定已清除；该邮箱还没有导入账户。'
-            : `绑定已清除；账户配置未改动（${r.reason}）。`;
-      } else {
-        note = '该邮箱没有已保存的绑定，未做改动。';
+            ? '已设为机房直出；该邮箱还没有导入账户，将在首次推送时生效。'
+            : `已设为机房直出，但暂未写入账户（${r.reason}），将在下次推送时生效。`;
       }
       return sendJson(res, 200, {
         ok: true,
