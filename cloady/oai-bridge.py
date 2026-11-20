@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """OpenAI chat/completions -> Gemini generateContent. Python 3 stdlib only."""
-import json, os, re, threading, time, uuid, urllib.request, urllib.error
+import copy, json, os, random, re, threading, time, uuid, urllib.request, urllib.error
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
@@ -15,6 +15,141 @@ SAFETY = [{"category": c, "threshold": "BLOCK_NONE"} for c in (
 FINISH = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "content_filter",
           "PROHIBITED_CONTENT": "content_filter", "BLOCKLIST": "content_filter",
           "RECITATION": "content_filter", "SPII": "content_filter"}
+
+# ---- 抗截断 B：合成工具调用传输（仿 su-kaka 现行 gcli2api / agy2api） ----
+# 给请求塞一个随机命名的假工具并强制调用（toolConfig ANY），要求模型把完整回复
+# 写进工具的 content 参数，桥再把参数还原成正文发给客户端：正文不走正文通道，
+# 躲开流式审查中途掐断。实测本站（AI Studio 线）：工具参数整包到达、不分片，
+# 所以流式下正文是「等全文到齐→切片下发」，首字延迟约等于整篇生成时间。
+# 若 finish=length（参数本身撞上输出上限）→ 回喂已收内容自动续写，最多
+# ANTI_TRUNC_MAX 次（环境变量 OAI_BRIDGE_ANTI_TRUNC_MAX，默认 3）。
+# 本线实测：工具调用被上限截断时整包被上游吞掉、无部分可捞（不像 Antigravity 线
+# 有 partialArgs 前缀）——所以若多轮仍一字未得，最后兜底走一次普通文本请求，
+# 至少交出半截正文，好过空回。环境变量 OAI_BRIDGE_TOOL_TRANSPORT=off 整体
+# 关闭 B；客户端自己带 tools 时不注入。
+TOOL_TRANSPORT = os.environ.get("OAI_BRIDGE_TOOL_TRANSPORT", "on") != "off"
+ANTI_TRUNC_MAX = int(os.environ.get("OAI_BRIDGE_ANTI_TRUNC_MAX", "3"))
+_TOOL_WORDS = ("emit", "relay", "convey", "deliver", "transmit", "present")
+CONTINUATION_PROMPT = ("【系统提示】你上一段回复在发送途中被中断了。请从中断处紧接着继续："
+                       "不要重复已经写过的内容，不要道歉、不要解释、不要重新开头。")
+
+
+def new_tool_name():
+    return random.choice(_TOOL_WORDS) + "_" + uuid.uuid4().hex[:12]
+
+
+def _append_system(req, text):
+    part = {"text": text}
+    si = req.get("systemInstruction")
+    req = dict(req)
+    if si and si.get("parts"):
+        si = dict(si)
+        si["parts"] = list(si["parts"]) + [part]
+        req["systemInstruction"] = si
+    else:
+        req["systemInstruction"] = {"parts": [part]}
+    return req
+
+
+def inject_tool(req, name):
+    req = copy.deepcopy(req)
+    req["tools"] = [{"functionDeclarations": [{
+        "name": name,
+        "description": "Send your final reply to the user through this tool.",
+        "parameters": {"type": "OBJECT",
+                       "properties": {
+                           "thought": {"type": "STRING",
+                                       "description": "A brief summary of your reasoning."},
+                           "content": {"type": "STRING",
+                                       "description": "Your complete reply text, exactly as the user should read it."}},
+                       "required": ["content"]}}]}]
+    req["toolConfig"] = {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]}}
+    return _append_system(req, (
+        "【系统要求】你必须通过名为 " + name + " 的工具发送你的最终回复："
+        "把完整回复正文原样写进该工具的 content 参数，thought 参数只写一句简短的思考摘要；"
+        "不要在工具之外输出任何正文，也不要向用户提及这个工具或这条要求。"))
+
+
+def with_tool_continuation(req, name, accumulated, sig=None):
+    # Gemini 4 硬性要求：回喂的 functionCall 必须带上模型当初发出的 thoughtSignature，
+    # 缺了直接 400。签名取自上一轮 functionCall 所在的 part。
+    part = {"functionCall": {"name": name, "args": {"content": accumulated}}}
+    if sig:
+        part["thoughtSignature"] = sig
+    r = copy.deepcopy(req)
+    r["contents"] = list(r["contents"]) + [
+        {"role": "model", "parts": [part]},
+        {"role": "user", "parts": [
+            {"functionResponse": {"name": name, "response": {"result": "received"}}},
+            {"text": CONTINUATION_PROMPT}]},
+    ]
+    return r
+
+
+def _content_from_args_str(s):
+    """args 是字符串（可能被截断的 JSON）时，抢救 content 字段已解码的前缀。"""
+    i = s.find('"content"')
+    if i < 0:
+        return None
+    colon = s.find(':', i)
+    j = s.find('"', colon + 1) if colon >= 0 else -1
+    if j < 0:
+        return None
+    out, k = [], j + 1
+    while k < len(s):
+        ch = s[k]
+        if ch == "\\" and k + 1 < len(s):
+            esc = s[k + 1]
+            if esc == "u" and len(s) >= k + 6:
+                try:
+                    out.append(chr(int(s[k + 2:k + 6], 16)))
+                    k += 6
+                    continue
+                except ValueError:
+                    break
+            out.append({"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f"}.get(esc, esc))
+            k += 2
+            continue
+        if ch == '"':
+            break
+        out.append(ch)
+        k += 1
+    return "".join(out)
+
+
+def extract_parts(g, name=None):
+    """从一条 Gemini 响应/流块抽 (工具正文 or None, 纯文本, finish or None, 工具签名 or None)。"""
+    cands = g.get("candidates") or []
+    if not cands:
+        reason = (g.get("promptFeedback") or {}).get("blockReason", "")
+        return None, "", "content_filter" if reason else "stop", None
+    c = cands[0]
+    call, plain, sig = None, "", None
+    for p in (c.get("content") or {}).get("parts", []):
+        fc = p.get("functionCall")
+        if fc and (name is None or fc.get("name") == name):
+            if p.get("thoughtSignature"):
+                sig = p["thoughtSignature"]
+            args = fc.get("args")
+            content = None
+            if isinstance(args, dict):
+                content = args.get("content")
+            elif isinstance(args, str):
+                content = _content_from_args_str(args)
+            if content:
+                call = (call or "") + str(content)
+        elif p.get("text") and not p.get("thought"):
+            plain += p["text"]
+    fin = FINISH.get(c["finishReason"], "stop") if c.get("finishReason") else None
+    return call, plain, fin, sig
+
+
+def _sum_usage(total, meta):
+    for k in ("promptTokenCount", "candidatesTokenCount", "thoughtsTokenCount", "totalTokenCount"):
+        v = (meta or {}).get(k)
+        if v:
+            total[k] = total.get(k, 0) + v
+    return total
 
 
 def to_parts(content):
@@ -136,7 +271,7 @@ def _account_email():
     return email
 
 
-def record_usage(model, path_kind, usage_meta, ttfb_ms, dur_ms, ok, finish, error=""):
+def record_usage(model, path_kind, usage_meta, ttfb_ms, dur_ms, ok, finish, error="", cont=0):
     u = usage_meta or {}
     rec = {
         "id": uuid.uuid4().hex[:16],
@@ -152,6 +287,7 @@ def record_usage(model, path_kind, usage_meta, ttfb_ms, dur_ms, ok, finish, erro
         "ok": bool(ok),
         "finish": finish or "",
         "error": (error or "")[:200],
+        "cont": cont,
     }
     with _lock:
         _records.append(rec)
@@ -323,7 +459,7 @@ USAGE_PAGE = """<!DOCTYPE html>
       rc.innerHTML = d.records.length ? d.records.map(function(r){
         var st = !r.ok ? '<span class="bad">失败</span>' : (r.completion===0 ? '<span class="bad">失败 · 空回</span>' : '<span class="ok">成功</span>');
         return '<div class="rec"><div style="display:flex;justify-content:space-between;"><span>'+fmtTime(r.ts)+' · '+esc(r.model)+'</span>'+st+'</div>'
-          +'<div style="color:#9ca3af;margin-top:3px;">输入 '+fmtNum(r.prompt)+' → 输出 '+fmtNum(r.completion)+'（思考 '+fmtNum(r.thoughts)+'）· 首字 '+fmtMs(r.ttfb_ms)+' · 总 '+fmtMs(r.dur_ms)+'</div></div>';
+          +'<div style="color:#9ca3af;margin-top:3px;">输入 '+fmtNum(r.prompt)+' → 输出 '+fmtNum(r.completion)+'（思考 '+fmtNum(r.thoughts)+'）· 首字 '+fmtMs(r.ttfb_ms)+' · 总 '+fmtMs(r.dur_ms)+(r.cont ? ' · 续写 '+r.cont+' 次' : '')+'</div></div>';
       }).join('') : '<div class="empty">暂无记录</div>';
     }).catch(function(){});
   }
@@ -428,42 +564,93 @@ class H(BaseHTTPRequestHandler):
         except ValueError:
             return self.send(400, {"error": {"message": "bad json"}})
         model = str(body.get("model") or "gemini-2.5-flash").removeprefix("models/")
+        use_tool = TOOL_TRANSPORT and not body.get("tools") \
+            and not body.get("tool_choice") and not body.get("functions")
         if body.get("stream"):
-            return self.stream(model, to_gemini(body))
+            return self.stream(model, to_gemini(body), use_tool)
+        greq = to_gemini(body)
+        name = new_tool_name() if use_tool else None
+        greq_plain = greq
+        if use_tool:
+            greq = inject_tool(greq, name)
         t0 = time.time()
-        code, g = self.call("POST", f"/v1beta/models/{model}:generateContent", to_gemini(body))
+        total_usage = {}
+        acc_text = ""
+        finish = ""
+        cont = 0
+        sig = None
+        while True:
+            if cont == 0 or not acc_text:
+                nxt = greq  # 还没攒下正文（如死在思考阶段）→ 原样重发，不拼续写
+            else:
+                nxt = with_tool_continuation(greq, name, acc_text, sig)
+            code, g = self.call("POST", f"/v1beta/models/{model}:generateContent", nxt)
+            if code != 200:
+                if cont > 0 and acc_text:
+                    finish = "length"  # 续写请求失败：把已收到的部分交出去，好过报错
+                    break
+                record_usage(model, "oai", total_usage, None, int((time.time() - t0) * 1000), False, "",
+                             (g.get("error") or {}).get("message", "") if isinstance(g.get("error"), dict) else "", cont)
+                return self.err(code, g)
+            _sum_usage(total_usage, g.get("usageMetadata"))
+            if use_tool:
+                call, plain, fin, csig = extract_parts(g, name)
+                if csig:
+                    sig = csig
+                text = call if call is not None else plain
+                finish = fin or "stop"
+            else:
+                text, finish = from_gemini(g)
+            acc_text += text
+            if finish != "length" or not use_tool or cont >= ANTI_TRUNC_MAX:
+                break
+            cont += 1
+        if use_tool and not acc_text and finish != "content_filter":
+            # 工具通道多轮一字未得（调用被上限整包吞掉）：兜底走一次普通文本，
+            # 交半截正文也好过空回。兜底失败不覆盖已有 finish/账目。
+            code, g = self.call("POST", f"/v1beta/models/{model}:generateContent", greq_plain)
+            if code == 200:
+                _sum_usage(total_usage, g.get("usageMetadata"))
+                acc_text, finish = from_gemini(g)
         dur_ms = int((time.time() - t0) * 1000)
-        if code != 200:
-            record_usage(model, "oai", {}, None, dur_ms, False, "",
-                         (g.get("error") or {}).get("message", "") if isinstance(g.get("error"), dict) else "")
-            return self.err(code, g)
-        text, finish = from_gemini(g)
-        record_usage(model, "oai", g.get("usageMetadata"), None, dur_ms, True, finish)
+        record_usage(model, "oai", total_usage, None, dur_ms, True, finish, "", cont)
         self.send(200, {"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion",
                         "created": int(time.time()), "model": model,
-                        "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                                     "finish_reason": finish}], "usage": usage(g)})
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": acc_text},
+                                     "finish_reason": finish}],
+                        "usage": {"prompt_tokens": total_usage.get("promptTokenCount", 0),
+                                  "completion_tokens": total_usage.get("candidatesTokenCount", 0),
+                                  "total_tokens": total_usage.get("totalTokenCount", 0)}})
 
-    def stream(self, model, payload):
+    def stream(self, model, payload, use_tool=False):
         t0 = time.time()
-        r = urllib.request.Request(f"{UPSTREAM}/v1beta/models/{model}:streamGenerateContent?alt=sse",
-                                   data=json.dumps(payload).encode(), method="POST",
-                                   headers={"Content-Type": "application/json", "x-goog-api-key": self.key()})
-        try:
-            resp = urllib.request.urlopen(r, timeout=600)
-        except urllib.error.HTTPError as e:
-            raw = e.read()
+        name = new_tool_name() if use_tool else None
+        plain_payload = payload
+        if use_tool:
+            payload = inject_tool(payload, name)
+
+        def open_upstream(cur):
+            r = urllib.request.Request(f"{UPSTREAM}/v1beta/models/{model}:streamGenerateContent?alt=sse",
+                                       data=json.dumps(cur).encode(), method="POST",
+                                       headers={"Content-Type": "application/json", "x-goog-api-key": self.key()})
             try:
-                gerr = json.loads(raw)
-            except ValueError:
-                gerr = {"error": {"message": raw.decode("utf-8", "replace")}}
+                return urllib.request.urlopen(r, timeout=600), 0, None
+            except urllib.error.HTTPError as e:
+                raw = e.read()
+                try:
+                    gerr = json.loads(raw)
+                except ValueError:
+                    gerr = {"error": {"message": raw.decode("utf-8", "replace")}}
+                return None, e.code, gerr
+            except (urllib.error.URLError, OSError) as e:
+                return None, 502, {"error": {"message": f"upstream {UPSTREAM} unreachable: {e}"}}
+
+        # 首轮在发响应头之前打开：上游报错还能按 HTTP 错误返回（与旧行为一致）
+        resp, ecode, gerr = open_upstream(payload)
+        if resp is None:
             record_usage(model, "oai-stream", {}, None, int((time.time() - t0) * 1000), False, "",
                          (gerr.get("error") or {}).get("message", "") if isinstance(gerr.get("error"), dict) else "")
-            return self.err(e.code, gerr)
-        except (urllib.error.URLError, OSError) as e:
-            record_usage(model, "oai-stream", {}, None, int((time.time() - t0) * 1000), False, "",
-                         f"upstream unreachable: {e}")
-            return self.err(502, {"error": {"message": f"upstream {UPSTREAM} unreachable: {e}"}})
+            return self.err(ecode, gerr)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -479,47 +666,127 @@ class H(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
             self.wfile.flush()
 
+        acc_text = ""
+        total_usage = {}
         t_first = None
-        last_usage = {}
         stream_err = ""
         disconnected = False
         finish = None
+        cont = 0
+        sig = None
+
+        def emit_piece(piece):
+            nonlocal t_first
+            if t_first is None:
+                t_first = time.time()
+            if use_tool:
+                # 工具参数整包到达：切成小片下发，客户端渲染更顺，也避免单个巨块
+                for i in range(0, len(piece), 120):
+                    emit({"content": piece[i:i + 120]})
+            else:
+                emit({"content": piece})
+
         try:
             emit({"role": "assistant", "content": ""})
-            with resp:
-                for line in resp:
-                    line = line.strip()
-                    if not line.startswith(b"data:"):
-                        continue
-                    g = json.loads(line[5:].strip() or b"{}")
-                    if g.get("usageMetadata"):
-                        last_usage = g["usageMetadata"]
-                    if isinstance(g.get("error"), dict):
-                        stream_err = g["error"].get("message", "")
-                        emit({"content": f"[error] {stream_err}"})
-                        finish = "stop"
+            while True:
+                if cont > 0:
+                    # 还没攒下正文（如死在思考阶段）→ 原样重发，不拼续写
+                    nxt = with_tool_continuation(payload, name, acc_text, sig) if acc_text else payload
+                    resp, ecode, gerr = open_upstream(nxt)
+                    if resp is None:
+                        if acc_text:
+                            break  # 续写打不开：已发的部分就是最终结果，好过报错
+                        stream_err = (gerr.get("error") or {}).get("message", "") \
+                            if isinstance(gerr.get("error"), dict) else "upstream error"
                         break
-                    text, fin = from_gemini(g)
-                    if text:
-                        if t_first is None:
-                            t_first = time.time()
-                        emit({"content": text})
-                    else:
-                        # thinking chunks carry no text; a comment keeps idle clients from timing out
-                        self.wfile.write(b": thinking\n\n")
-                        self.wfile.flush()
-                    if (g.get("candidates") or [{}])[0].get("finishReason"):
-                        finish = fin
+                attempt_finish = None
+                attempt_err = ""
+                attempt_usage = {}
+                with resp:
+                    for line in resp:
+                        line = line.strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        g = json.loads(line[5:].strip() or b"{}")
+                        if g.get("usageMetadata"):
+                            # 流内 usageMetadata 是累计值：一轮内取最后一份，跨轮再相加
+                            attempt_usage = g["usageMetadata"]
+                        if isinstance(g.get("error"), dict):
+                            attempt_err = g["error"].get("message", "")
+                            break
+                        raw_fin = (g.get("candidates") or [{}])[0].get("finishReason")
+                        if use_tool:
+                            call, plain, fin, csig = extract_parts(g, name)
+                            if csig:
+                                sig = csig
+                            piece = call if call is not None else plain
+                        else:
+                            piece, fin = from_gemini(g)
+                        if piece:
+                            acc_text += piece
+                            emit_piece(piece)
+                        else:
+                            # thinking chunks carry no text; a comment keeps idle clients from timing out
+                            self.wfile.write(b": thinking\n\n")
+                            self.wfile.flush()
+                        if raw_fin:
+                            attempt_finish = fin
+                if attempt_err:
+                    stream_err = attempt_err
+                    break
+                _sum_usage(total_usage, attempt_usage)
+                finish = attempt_finish
+                retryable = finish == "length" or (finish is None and not acc_text)
+                if not retryable or not use_tool or cont >= ANTI_TRUNC_MAX:
+                    break
+                cont += 1
+        except (BrokenPipeError, ConnectionResetError):
+            disconnected = True
+        if use_tool and not acc_text and not stream_err and not disconnected \
+                and finish != "content_filter":
+            # 工具通道多轮一字未得（调用被上限整包吞掉/流无声断掉）：兜底走一次
+            # 普通文本，交半截正文也好过空回。
+            try:
+                resp, ecode, gerr = open_upstream(plain_payload)
+                if resp is not None:
+                    fb_usage = {}
+                    with resp:
+                        for line in resp:
+                            line = line.strip()
+                            if not line.startswith(b"data:"):
+                                continue
+                            g = json.loads(line[5:].strip() or b"{}")
+                            if g.get("usageMetadata"):
+                                fb_usage = g["usageMetadata"]
+                            if isinstance(g.get("error"), dict):
+                                break
+                            piece, fin = from_gemini(g)
+                            if piece:
+                                acc_text += piece
+                                if t_first is None:
+                                    t_first = time.time()
+                                emit({"content": piece})
+                            if (g.get("candidates") or [{}])[0].get("finishReason"):
+                                finish = fin
+                    _sum_usage(total_usage, fb_usage)
+            except (BrokenPipeError, ConnectionResetError):
+                disconnected = True
+        if stream_err:
+            try:
+                emit({"content": f"[error] {stream_err}"})
+            except (BrokenPipeError, ConnectionResetError):
+                disconnected = True
+        try:
             emit({}, finish or "stop")
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             disconnected = True
-        record_usage(model, "oai-stream", last_usage,
+        record_usage(model, "oai-stream", total_usage,
                      int((t_first - t0) * 1000) if t_first else None,
                      int((time.time() - t0) * 1000),
                      not stream_err and not disconnected, finish or "",
-                     stream_err or ("client disconnected" if disconnected else ""))
+                     stream_err or ("client disconnected" if disconnected else ""), cont)
 
     def passthrough(self):
         # Front-door fallback: anything that is not an OpenAI route is proxied
