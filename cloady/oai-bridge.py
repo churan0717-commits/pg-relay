@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """OpenAI chat/completions -> Gemini generateContent. Python 3 stdlib only."""
-import copy, json, os, random, re, threading, time, uuid, urllib.request, urllib.error
+import copy, hashlib, hmac, json, os, random, re, secrets, threading, time, uuid, urllib.request, urllib.error
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
@@ -251,6 +251,117 @@ _records = deque(maxlen=20000)
 _lock = threading.Lock()
 _appends = [0]
 _acct_cache = {"ts": 0.0, "email": ""}
+
+
+# ---------------- 面板口令（站长门） ----------------
+# 面板与管理接口（/、/api/*、/usage 等）必须登录后才能用；/v1/* API 与
+# /health 不拦（酒馆调用不受影响）。口令哈希、会话签名密钥、巡检内部令牌
+# 都存在数据卷上，重启/换容器不丢。口令由用户本人在登录页设置，桥只存哈希。
+DATA_DIR = os.path.dirname(USAGE_FILE) or "."
+PANEL_AUTH_FILE = os.path.join(DATA_DIR, "panel-auth.json")
+PANEL_SECRET_FILE = os.path.join(DATA_DIR, "panel-secret")
+INTERNAL_TOKEN_FILE = os.path.join(DATA_DIR, "internal-token")
+SESSION_TTL = 7 * 24 * 3600
+
+
+def _data_file(path, create=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        if create is None:
+            return ""
+        val = create()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(val)
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return val
+
+
+def _panel_secret():
+    return _data_file(PANEL_SECRET_FILE, lambda: secrets.token_hex(32))
+
+
+def _internal_token():
+    return _data_file(INTERNAL_TOKEN_FILE, lambda: secrets.token_hex(24))
+
+
+def _panel_hash():
+    try:
+        with open(PANEL_AUTH_FILE, encoding="utf-8") as f:
+            return json.load(f).get("hash", "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _hash_pw(pw, salt=None):
+    salt = salt or secrets.token_bytes(16)
+    dk = hashlib.scrypt(pw.encode("utf-8"), salt=salt, n=16384, r=8, p=1, dklen=32)
+    return salt.hex() + "$" + dk.hex()
+
+
+def _verify_pw(pw, stored):
+    try:
+        salt_hex, dk_hex = stored.split("$", 1)
+        dk = hashlib.scrypt(pw.encode("utf-8"), salt=bytes.fromhex(salt_hex),
+                            n=16384, r=8, p=1, dklen=32)
+        return hmac.compare_digest(dk.hex(), dk_hex)
+    except (ValueError, TypeError):
+        return False
+
+
+def _session_value():
+    exp = str(int(time.time()) + SESSION_TTL)
+    sig = hmac.new(_panel_secret().encode(), exp.encode(), hashlib.sha256).hexdigest()
+    return exp + "." + sig
+
+
+def _session_ok(value):
+    try:
+        exp, sig = value.split(".", 1)
+        if int(exp) < int(time.time()):
+            return False
+        want = hmac.new(_panel_secret().encode(), exp.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, want)
+    except (ValueError, TypeError):
+        return False
+
+
+def _login_page(setup, msg=""):
+    title = "设置站长口令" if setup else "奶盖绿茶 · 登录"
+    btn = "设置并进入" if setup else "进入"
+    action = "/__panel/setup" if setup else "/__panel/login"
+    confirm = ('<input name="pw2" type="text" placeholder="再输一遍确认" autocomplete="off">'
+               if setup else "")
+    hint = ("第一次打开，先给面板设个口令，设完就只有你能进。"
+            if setup else "输入站长口令进入面板。")
+    msg_html = ('<div style="color:#dc2626;font-size:13px;margin-top:10px;">'
+                + msg + "</div>") if msg else ""
+    return """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>""" + title + """</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: #f9fafb; color: #111827; padding: 40px 16px; }
+  .card { max-width: 340px; margin: 0 auto; background: #fff; border: 1.5px solid #e5e7eb; border-radius: 16px; padding: 22px 18px; box-shadow: 0 6px 20px rgba(16,163,127,.08); }
+  h1 { font-size: 17px; margin-bottom: 6px; }
+  p { font-size: 12px; color: #9ca3af; margin-bottom: 14px; }
+  input { width: 100%; padding: 11px 12px; border: 1.5px solid #d1d5db; border-radius: 10px; font-size: 15px; margin-bottom: 10px; -webkit-text-security: disc; }
+  input:focus { outline: none; border-color: #10a37f; }
+  button { width: 100%; padding: 11px 0; border: none; border-radius: 10px; background: #10a37f; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; }
+</style></head><body><div class="card">
+  <h1>""" + title + """</h1><p>""" + hint + """</p>
+  <form method="POST" action=\"""" + action + """\">
+    <input name="pw" type="text" placeholder="站长口令" autocomplete="off">
+    """ + confirm + """
+    <button type="submit">""" + btn + """</button>
+  </form>""" + msg_html + """
+</div></body></html>
+"""
 
 
 def _load_usage():
@@ -541,8 +652,72 @@ class H(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
 
+    def _authed(self):
+        tok = self.headers.get("X-Internal-Token", "")
+        if tok and hmac.compare_digest(tok, _internal_token()):
+            return True
+        for part in self.headers.get("Cookie", "").split(";"):
+            part = part.strip()
+            if part.startswith("ng_session="):
+                return _session_ok(part[len("ng_session="):])
+        return False
+
+    def _need_auth(self, page=False):
+        if page:
+            self.send_response(302)
+            self.send_header("Location", "/__panel/login")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self.send(401, {"error": {"message": "panel login required"}})
+
+    def _panel_post(self, setup):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+        form = parse_qs(raw)
+        pw = (form.get("pw") or [""])[0]
+        if setup:
+            if _panel_hash():
+                return self.send_html(_login_page(False, "口令已经设过了，请直接登录"))
+            pw2 = (form.get("pw2") or [""])[0]
+            if len(pw) < 4:
+                return self.send_html(_login_page(True, "口令至少 4 个字"))
+            if pw != pw2:
+                return self.send_html(_login_page(True, "两次输入不一致，再试一次"))
+            try:
+                with open(PANEL_AUTH_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"hash": _hash_pw(pw)}, f)
+                os.chmod(PANEL_AUTH_FILE, 0o600)
+            except OSError:
+                return self.send_html(_login_page(True, "存口令失败，请再试一次"))
+        else:
+            if not _panel_hash():
+                return self.send_html(_login_page(True))
+            if not _verify_pw(pw, _panel_hash()):
+                time.sleep(0.6)
+                return self.send_html(_login_page(False, "口令不对，再试一次"))
+        self.send_response(302)
+        self.send_header("Location", "/")
+        self.send_header("Set-Cookie", "ng_session=" + _session_value()
+                         + "; Path=/; Max-Age=" + str(SESSION_TTL) + "; HttpOnly; SameSite=Lax")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
+        if path == "/__panel/login":
+            return self.send_html(_login_page(setup=not _panel_hash()))
+        if path == "/__panel/logout":
+            self.send_response(302)
+            self.send_header("Location", "/__panel/login")
+            self.send_header("Set-Cookie", "ng_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+            self.send_header("Content-Length", "0")
+            return self.end_headers()
+        if path == "/__panel/internal-token":
+            # 只在口令还没设时开放，供巡检取走内部令牌；用户设完口令即永久关闭
+            if _panel_hash():
+                return self.send(404, {"error": {"message": "not found"}})
+            return self.send(200, {"token": _internal_token()})
         if path in ("/v1/models", "/models"):
             code, g = self.call("GET", "/v1beta/models")
             if code != 200:
@@ -562,11 +737,17 @@ class H(BaseHTTPRequestHandler):
         if path == "/health":
             return self.send(200, {"ok": True, "upstream": UPSTREAM})
         if path == "/usage":
+            if not self._authed():
+                return self._need_auth(page=True)
             return self.send_html(USAGE_PAGE)
         if path == "/api/usage":
+            if not self._authed():
+                return self._need_auth()
             q = parse_qs(urlparse(self.path).query)
             return self.send(200, usage_report((q.get("day") or ["cn"])[0]))
         if path == "/api/usage/export":
+            if not self._authed():
+                return self._need_auth()
             q = parse_qs(urlparse(self.path).query)
             since = (q.get("since") or [""])[0]
             with _lock:
@@ -579,6 +760,10 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")
+        if path == "/__panel/login":
+            return self._panel_post(setup=False)
+        if path == "/__panel/setup":
+            return self._panel_post(setup=True)
         if path not in ("/v1/chat/completions", "/chat/completions"):
             return self.passthrough()
         try:
@@ -815,6 +1000,9 @@ class H(BaseHTTPRequestHandler):
     def passthrough(self):
         # Front-door fallback: anything that is not an OpenAI route is proxied
         # verbatim to the upstream aistudio-api (panel, /api/*, /v1beta/*).
+        # 面板与管理接口先过站长门：没登录的浏览器跳登录页，接口调用回 401。
+        if not self._authed():
+            return self._need_auth(page="text/html" in self.headers.get("Accept", ""))
         t_start = time.time()
         length = int(self.headers.get("Content-Length", 0) or 0)
         data = self.rfile.read(length) if length else None
