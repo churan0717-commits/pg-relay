@@ -26,7 +26,9 @@ FINISH = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "content_filter",
 # 本线实测：工具调用被上限截断时整包被上游吞掉、无部分可捞（不像 Antigravity 线
 # 有 partialArgs 前缀）——所以若多轮仍一字未得，最后兜底走一次普通文本请求，
 # 至少交出半截正文，好过空回。环境变量 OAI_BRIDGE_TOOL_TRANSPORT=off 整体
-# 关闭 B；客户端自己带 tools 时不注入。
+# 关闭 B。客户端自己带 tools 时：工具照常转发给谷歌、调用按 OpenAI 格式交回；
+# 若同时选了防截断，回复工具与客户端工具同场（toolConfig AUTO，正文走回复
+# 工具、插件工具被调用时原样交回客户端，不自动续写）。
 TOOL_TRANSPORT = os.environ.get("OAI_BRIDGE_TOOL_TRANSPORT", "on") != "off"
 ANTI_TRUNC_MAX = int(os.environ.get("OAI_BRIDGE_ANTI_TRUNC_MAX", "3"))
 # 启用方式与 su-kaka 对齐：模型名前缀标注（agy2api 用「抗截断-」、gcli2api 用
@@ -64,23 +66,71 @@ def _append_system(req, text):
     return req
 
 
-def inject_tool(req, name):
+def inject_tool(req, name, coexist=False):
     req = copy.deepcopy(req)
-    req["tools"] = [{"functionDeclarations": [{
-        "name": name,
-        "description": "Send your final reply to the user through this tool.",
-        "parameters": {"type": "OBJECT",
-                       "properties": {
-                           "thought": {"type": "STRING",
-                                       "description": "A brief summary of your reasoning."},
-                           "content": {"type": "STRING",
-                                       "description": "Your complete reply text, exactly as the user should read it."}},
-                       "required": ["content"]}}]}]
-    req["toolConfig"] = {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]}}
+    decl = {"name": name,
+            "description": "Send your final reply to the user through this tool.",
+            "parameters": {"type": "OBJECT",
+                           "properties": {
+                               "thought": {"type": "STRING",
+                                           "description": "A brief summary of your reasoning."},
+                               "content": {"type": "STRING",
+                                           "description": "Your complete reply text, exactly as the user should read it."}},
+                           "required": ["content"]}}
+    if coexist:
+        # 与客户端工具同场：声明并在一起，不强压 ANY（插件工具要能被正常选中），
+        # 靠系统指令引导正文走回复工具；客户端已给了 toolConfig 时尊重它的。
+        decls = []
+        for t in req.get("tools") or []:
+            decls.extend(t.get("functionDeclarations") or [])
+        decls.append(decl)
+        req["tools"] = [{"functionDeclarations": decls}]
+        if "toolConfig" not in req:
+            req["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
+    else:
+        req["tools"] = [{"functionDeclarations": [decl]}]
+        req["toolConfig"] = {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]}}
     return _append_system(req, (
         "【系统要求】你必须通过名为 " + name + " 的工具发送你的最终回复："
         "把完整回复正文原样写进该工具的 content 参数，thought 参数只写一句简短的思考摘要；"
         "不要在工具之外输出任何正文，也不要向用户提及这个工具或这条要求。"))
+
+
+def client_tools(body):
+    """客户端带来的工具（OpenAI tools / 旧版 functions）→ Gemini 函数声明列表。"""
+    decls = []
+    for t in body.get("tools") or []:
+        if isinstance(t, dict) and t.get("type") in (None, "function"):
+            f = t.get("function") or {}
+            if f.get("name"):
+                d = {"name": f["name"], "description": f.get("description", "")}
+                if f.get("parameters"):
+                    d["parameters"] = f["parameters"]
+                decls.append(d)
+    for f in body.get("functions") or []:
+        if isinstance(f, dict) and f.get("name"):
+            d = {"name": f["name"], "description": f.get("description", "")}
+            if f.get("parameters"):
+                d["parameters"] = f["parameters"]
+            decls.append(d)
+    return decls
+
+
+def extract_calls(g, skip=None):
+    """从一条 Gemini 响应抽 functionCall（跳过 skip 名）→ OpenAI tool_calls 列表。"""
+    calls = []
+    cands = g.get("candidates") or []
+    if not cands:
+        return calls
+    for p in (cands[0].get("content") or {}).get("parts", []):
+        fc = p.get("functionCall")
+        if fc and fc.get("name") and fc.get("name") != skip:
+            args = fc.get("args")
+            if not isinstance(args, str):
+                args = json.dumps(args or {}, ensure_ascii=False)
+            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                          "function": {"name": fc["name"], "arguments": args}})
+    return calls
 
 
 def with_tool_continuation(req, name, accumulated, sig=None):
@@ -184,14 +234,54 @@ def to_parts(content):
 
 def to_gemini(body):
     system, contents = [], []
+    id2name = {}
     for m in body.get("messages", []):
-        role, parts = m.get("role"), to_parts(m.get("content"))
+        role = m.get("role")
+        if role in ("system", "developer"):
+            system.extend(to_parts(m.get("content")))
+            continue
+        parts = []
+        if role == "assistant":
+            parts.extend(to_parts(m.get("content")))
+            for tc_ in m.get("tool_calls") or []:
+                fn = tc_.get("function") or {}
+                nm = fn.get("name") or tc_.get("name")
+                if not nm:
+                    continue
+                if tc_.get("id"):
+                    id2name[tc_["id"]] = nm
+                args = fn.get("arguments")
+                try:
+                    args = json.loads(args) if isinstance(args, str) else (args or {})
+                except ValueError:
+                    args = {"_raw": str(args)}
+                parts.append({"functionCall": {"name": nm, "args": args}})
+            fc_ = m.get("function_call")
+            if isinstance(fc_, dict) and fc_.get("name"):
+                args = fc_.get("arguments")
+                try:
+                    args = json.loads(args) if isinstance(args, str) else (args or {})
+                except ValueError:
+                    args = {"_raw": str(args)}
+                parts.append({"functionCall": {"name": fc_["name"], "args": args}})
+            g_role = "model"
+        elif role in ("tool", "function"):
+            nm = m.get("name") or id2name.get(m.get("tool_call_id") or "", "tool")
+            raw = m.get("content")
+            if isinstance(raw, list):
+                raw = "".join(p.get("text", "") for p in raw if isinstance(p, dict))
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+            except ValueError:
+                parsed = None
+            resp = parsed if isinstance(parsed, dict) else {"result": "" if raw is None else str(raw)}
+            parts.append({"functionResponse": {"name": nm, "response": resp}})
+            g_role = "user"
+        else:
+            parts.extend(to_parts(m.get("content")))
+            g_role = "user"
         if not parts:
             continue
-        if role in ("system", "developer"):
-            system.extend(parts)
-            continue
-        g_role = "model" if role == "assistant" else "user"
         if contents and contents[-1]["role"] == g_role:
             contents[-1]["parts"].extend(parts)
         else:
@@ -201,6 +291,27 @@ def to_gemini(body):
     req = {"contents": contents, "safetySettings": SAFETY}
     if system:
         req["systemInstruction"] = {"parts": system}
+    decls = client_tools(body)
+    if decls:
+        req["tools"] = [{"functionDeclarations": decls}]
+        tc = body.get("tool_choice")
+        if tc is None and isinstance(body.get("function_call"), dict):
+            fcn = body["function_call"].get("name")
+            tc = {"type": "function", "function": {"name": fcn}} if fcn else body["function_call"]
+        mode, allowed = None, None
+        if tc == "none":
+            mode = "NONE"
+        elif tc == "required":
+            mode = "ANY"
+        elif isinstance(tc, dict):
+            nm = ((tc.get("function") or {}).get("name")) or tc.get("name")
+            if nm:
+                mode, allowed = "ANY", [nm]
+        if mode:
+            fcc = {"mode": mode}
+            if allowed:
+                fcc["allowedFunctionNames"] = allowed
+            req["toolConfig"] = {"functionCallingConfig": fcc}
     cfg = {}
     for o, g in (("temperature", "temperature"), ("top_p", "topP"), ("top_k", "topK")):
         if body.get(o) is not None:
@@ -772,21 +883,22 @@ class H(BaseHTTPRequestHandler):
             return self.send(400, {"error": {"message": "bad json"}})
         label = str(body.get("model") or "gemini-2.5-flash").removeprefix("models/")
         model, anti = split_anti_prefix(label)
-        use_tool = anti and TOOL_TRANSPORT and not body.get("tools") \
-            and not body.get("tool_choice") and not body.get("functions")
+        has_client_tools = bool(client_tools(body))
+        use_tool = anti and TOOL_TRANSPORT
         if body.get("stream"):
-            return self.stream(model, to_gemini(body), use_tool, label)
+            return self.stream(model, to_gemini(body), use_tool, label, has_client_tools)
         greq = to_gemini(body)
         name = new_tool_name() if use_tool else None
         greq_plain = greq
         if use_tool:
-            greq = inject_tool(greq, name)
+            greq = inject_tool(greq, name, coexist=has_client_tools)
         t0 = time.time()
         total_usage = {}
         acc_text = ""
         finish = ""
         cont = 0
         sig = None
+        calls = []
         while True:
             if cont == 0 or not acc_text:
                 nxt = greq  # 还没攒下正文（如死在思考阶段）→ 原样重发，不拼续写
@@ -801,6 +913,7 @@ class H(BaseHTTPRequestHandler):
                              (g.get("error") or {}).get("message", "") if isinstance(g.get("error"), dict) else "", cont)
                 return self.err(code, g)
             _sum_usage(total_usage, g.get("usageMetadata"))
+            calls = extract_calls(g, skip=name)
             if use_tool:
                 call, plain, fin, csig = extract_parts(g, name)
                 if csig:
@@ -810,10 +923,12 @@ class H(BaseHTTPRequestHandler):
             else:
                 text, finish = from_gemini(g)
             acc_text += text
+            if calls:
+                break  # 客户端工具被调用：这一轮交给客户端处理，不自动续写
             if finish != "length" or not use_tool or cont >= ANTI_TRUNC_MAX:
                 break
             cont += 1
-        if use_tool and not acc_text and finish != "content_filter":
+        if use_tool and not acc_text and not calls and finish != "content_filter":
             # 工具通道多轮一字未得（调用被上限整包吞掉）：兜底走一次普通文本，
             # 交半截正文也好过空回。兜底失败不覆盖已有 finish/账目。
             code, g = self.call("POST", f"/v1beta/models/{model}:generateContent", greq_plain)
@@ -821,22 +936,27 @@ class H(BaseHTTPRequestHandler):
                 _sum_usage(total_usage, g.get("usageMetadata"))
                 acc_text, finish = from_gemini(g)
         dur_ms = int((time.time() - t0) * 1000)
+        if calls:
+            finish = "tool_calls"
         record_usage(label, "oai", total_usage, None, dur_ms, True, finish, "", cont)
+        msg = {"role": "assistant", "content": acc_text if acc_text or not calls else None}
+        if calls:
+            msg["tool_calls"] = calls
         self.send(200, {"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion",
                         "created": int(time.time()), "model": label,
-                        "choices": [{"index": 0, "message": {"role": "assistant", "content": acc_text},
+                        "choices": [{"index": 0, "message": msg,
                                      "finish_reason": finish}],
                         "usage": {"prompt_tokens": total_usage.get("promptTokenCount", 0),
                                   "completion_tokens": total_usage.get("candidatesTokenCount", 0),
                                   "total_tokens": total_usage.get("totalTokenCount", 0)}})
 
-    def stream(self, model, payload, use_tool=False, label=None):
+    def stream(self, model, payload, use_tool=False, label=None, has_client_tools=False):
         label = label or model
         t0 = time.time()
         name = new_tool_name() if use_tool else None
         plain_payload = payload
         if use_tool:
-            payload = inject_tool(payload, name)
+            payload = inject_tool(payload, name, coexist=has_client_tools)
 
         def open_upstream(cur):
             r = urllib.request.Request(f"{UPSTREAM}/v1beta/models/{model}:streamGenerateContent?alt=sse",
@@ -870,10 +990,42 @@ class H(BaseHTTPRequestHandler):
         base = {"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion.chunk",
                 "created": int(time.time()), "model": label}
 
+        # 空块保活：等上游出声期间，每隔几秒发一个空内容块，让酒馆端计时走字、
+        # 连接不被中间环节当闲置掐掉（学 uncut-bridge）。间隔秒数由环境变量
+        # OAI_BRIDGE_KEEPALIVE_SEC 控制（默认 5），0 关闭。写套接字统一走锁，
+        # 保活线程与主线程不会把 SSE 行写花。
+        wlock = threading.Lock()
+        last_data = [time.time()]
+        ka_done = [False]
+
+        def write_bytes(b):
+            with wlock:
+                self.wfile.write(b)
+                self.wfile.flush()
+
         def emit(delta, fin=None):
             chunk = dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": fin}])
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-            self.wfile.flush()
+            write_bytes(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+            last_data[0] = time.time()
+
+        def keepalive():
+            try:
+                sec = float(os.environ.get("OAI_BRIDGE_KEEPALIVE_SEC", "5"))
+            except ValueError:
+                sec = 5.0
+            if sec <= 0:
+                return
+            while not ka_done[0]:
+                time.sleep(1)
+                if ka_done[0]:
+                    break
+                if time.time() - last_data[0] >= sec:
+                    try:
+                        emit({"content": ""})
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+
+        threading.Thread(target=keepalive, daemon=True).start()
 
         acc_text = ""
         total_usage = {}
@@ -883,6 +1035,7 @@ class H(BaseHTTPRequestHandler):
         finish = None
         cont = 0
         sig = None
+        client_called = False
 
         def emit_piece(piece):
             nonlocal t_first
@@ -924,6 +1077,13 @@ class H(BaseHTTPRequestHandler):
                             attempt_err = g["error"].get("message", "")
                             break
                         raw_fin = (g.get("candidates") or [{}])[0].get("finishReason")
+                        chunk_calls = extract_calls(g, skip=name if use_tool else None)
+                        if chunk_calls:
+                            for i, c in enumerate(chunk_calls):
+                                emit({"tool_calls": [dict(c, index=i)]})
+                            client_called = True
+                            attempt_finish = "tool_calls"
+                            break
                         if use_tool:
                             call, plain, fin, csig = extract_parts(g, name)
                             if csig:
@@ -936,8 +1096,7 @@ class H(BaseHTTPRequestHandler):
                             emit_piece(piece)
                         else:
                             # thinking chunks carry no text; a comment keeps idle clients from timing out
-                            self.wfile.write(b": thinking\n\n")
-                            self.wfile.flush()
+                            write_bytes(b": thinking\n\n")
                         if raw_fin:
                             attempt_finish = fin
                 if attempt_err:
@@ -945,6 +1104,8 @@ class H(BaseHTTPRequestHandler):
                     break
                 _sum_usage(total_usage, attempt_usage)
                 finish = attempt_finish
+                if client_called:
+                    break  # 客户端工具被调用：交给客户端，不续写、不兜底
                 retryable = finish == "length" or (finish is None and not acc_text)
                 if not retryable or not use_tool or cont >= ANTI_TRUNC_MAX:
                     break
@@ -952,7 +1113,7 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             disconnected = True
         if use_tool and not acc_text and not stream_err and not disconnected \
-                and finish != "content_filter":
+                and not client_called and finish != "content_filter":
             # 工具通道多轮一字未得（调用被上限整包吞掉/流无声断掉）：兜底走一次
             # 普通文本，交半截正文也好过空回。
             try:
@@ -987,10 +1148,10 @@ class H(BaseHTTPRequestHandler):
                 disconnected = True
         try:
             emit({}, finish or "stop")
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            write_bytes(b"data: [DONE]\n\n")
         except (BrokenPipeError, ConnectionResetError):
             disconnected = True
+        ka_done[0] = True
         record_usage(label, "oai-stream", total_usage,
                      int((t_first - t0) * 1000) if t_first else None,
                      int((time.time() - t0) * 1000),
