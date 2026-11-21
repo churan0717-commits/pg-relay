@@ -344,7 +344,9 @@ def from_gemini(g):
         reason = (g.get("promptFeedback") or {}).get("blockReason", "")
         return "", "content_filter" if reason else "stop"
     c = cands[0]
-    text = "".join(p.get("text", "") for p in (c.get("content") or {}).get("parts", [])
+    # 上游 aistudio-api 会把 part 的空字段填成 null（text:null 等），必须用 or "" 兜底，
+    # 否则 join 时 TypeError 把整个请求打崩（曾表现为非流式工具调用 502）。
+    text = "".join(p.get("text") or "" for p in (c.get("content") or {}).get("parts", [])
                    if not p.get("thought"))
     return text, FINISH.get(c.get("finishReason", "STOP"), "stop")
 
