@@ -363,6 +363,18 @@ CST = timezone(timedelta(hours=8))
 _records = deque(maxlen=20000)
 _lock = threading.Lock()
 _appends = [0]
+_pending = {}  # 正在进行中的请求：id -> 展示用记录。只在内存里，不落盘、
+# 不进导出（巡检收账只收已完成）；请求一结束就由 record_usage 摘掉，
+# 异常漏摘的由 usage_report 按 15 分钟过期清扫。
+
+
+def pending_start(model, path_kind):
+    rec = {"id": uuid.uuid4().hex[:16], "ts": int(time.time() * 1000),
+           "model": model, "account": _account_email(), "path": path_kind,
+           "pending": True}
+    with _lock:
+        _pending[rec["id"]] = rec
+    return rec["id"]
 _acct_cache = {"ts": 0.0, "email": ""}
 
 
@@ -508,7 +520,7 @@ def _account_email():
     return email
 
 
-def record_usage(model, path_kind, usage_meta, ttfb_ms, dur_ms, ok, finish, error="", cont=0):
+def record_usage(model, path_kind, usage_meta, ttfb_ms, dur_ms, ok, finish, error="", cont=0, pid=None):
     u = usage_meta or {}
     rec = {
         "id": uuid.uuid4().hex[:16],
@@ -527,6 +539,8 @@ def record_usage(model, path_kind, usage_meta, ttfb_ms, dur_ms, ok, finish, erro
         "cont": cont,
     }
     with _lock:
+        if pid:
+            _pending.pop(pid, None)
         _records.append(rec)
         try:
             with open(USAGE_FILE, "a", encoding="utf-8") as f:
@@ -597,12 +611,22 @@ def usage_report(day):
     for a in by_acct.values():
         a["share"] = round(a["total"] / total * 100) if total else 0
     recs = sorted(rows, key=lambda r: -r["ts"])[:50]
+    # 进行中的请求只进流水展示，不进汇总/按模型/按账号统计（还没结果）
+    now_ms = int(time.time() * 1000)
+    with _lock:
+        for k in [k for k, p in _pending.items() if now_ms - p["ts"] > 15 * 60 * 1000]:
+            _pending.pop(k, None)
+        pend = [dict(p, prompt=0, completion=0, thoughts=0, ttfb_ms=None,
+                     dur_ms=now_ms - p["ts"], ok=True, finish="", error="", cont=0)
+                for p in _pending.values() if s_ms <= p["ts"] < e_ms]
+    recs = sorted(pend + recs, key=lambda r: -r["ts"])[:50]
     return {"day": day,
             "start": start.strftime("%m月%d日 %H:%M"),
             "end": end.strftime("%m月%d日 %H:%M"),
             "summary": summary,
             "byModel": sorted(by_model.values(), key=lambda m: -m["total"]),
             "byAccount": sorted(by_acct.values(), key=lambda a: -a["total"]),
+            "pending": len(pend),
             "records": recs}
 
 
@@ -669,6 +693,7 @@ USAGE_PAGE = """<!DOCTYPE html>
   function fmtTime(ts){ var d=new Date(ts); function p(x){ return (x<10?'0':'')+x; } return p(d.getHours())+':'+p(d.getMinutes()); }
   function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
   function setDay(d){ day=d; document.getElementById('bCn').className='daybtn'+(d==='cn'?' on':''); document.getElementById('bUs').className='daybtn'+(d==='us'?' on':''); load(); }
+  var pTimer = null;
   function load(){
     fetch('/api/usage?day='+day).then(function(r){ return r.json(); }).then(function(d){
       document.getElementById('win').textContent = '统计区间：'+d.start+' → '+d.end;
@@ -694,10 +719,16 @@ USAGE_PAGE = """<!DOCTYPE html>
       }).join('') : '<div class="card"><div class="empty">暂无记录</div></div>';
       var rc=document.getElementById('records');
       rc.innerHTML = d.records.length ? d.records.map(function(r){
+        if (r.pending){
+          return '<div class="rec"><div style="display:flex;justify-content:space-between;"><span>'+fmtTime(r.ts)+' · '+esc(r.model)+'</span><span style="color:#d97706;font-weight:600;">正在进行</span></div>'
+            +'<div style="color:#9ca3af;margin-top:3px;">已进行 '+fmtMs(Date.now()-r.ts)+' · 完成后自动更新</div></div>';
+        }
         var st = !r.ok ? '<span class="bad">失败</span>' : (r.completion===0 ? '<span class="bad">失败 · 空回</span>' : '<span class="ok">成功</span>');
         return '<div class="rec"><div style="display:flex;justify-content:space-between;"><span>'+fmtTime(r.ts)+' · '+esc(r.model)+'</span>'+st+'</div>'
           +'<div style="color:#9ca3af;margin-top:3px;">输入 '+fmtNum(r.prompt)+' → 输出 '+fmtNum(r.completion)+'（思考 '+fmtNum(r.thoughts)+'）· 首字 '+fmtMs(r.ttfb_ms)+' · 总 '+fmtMs(r.dur_ms)+(r.cont ? ' · 续写 '+r.cont+' 次' : '')+'</div></div>';
       }).join('') : '<div class="empty">暂无记录</div>';
+      if (pTimer){ clearTimeout(pTimer); pTimer = null; }
+      if (d.pending){ pTimer = setTimeout(load, 5000); }
     }).catch(function(){});
   }
   load();
@@ -894,6 +925,7 @@ class H(BaseHTTPRequestHandler):
         greq_plain = greq
         if use_tool:
             greq = inject_tool(greq, name, coexist=has_client_tools)
+        pid = pending_start(label, "oai")
         t0 = time.time()
         total_usage = {}
         acc_text = ""
@@ -912,7 +944,7 @@ class H(BaseHTTPRequestHandler):
                     finish = "length"  # 续写请求失败：把已收到的部分交出去，好过报错
                     break
                 record_usage(label, "oai", total_usage, None, int((time.time() - t0) * 1000), False, "",
-                             (g.get("error") or {}).get("message", "") if isinstance(g.get("error"), dict) else "", cont)
+                             (g.get("error") or {}).get("message", "") if isinstance(g.get("error"), dict) else "", cont, pid=pid)
                 return self.err(code, g)
             _sum_usage(total_usage, g.get("usageMetadata"))
             calls = extract_calls(g, skip=name)
@@ -940,7 +972,7 @@ class H(BaseHTTPRequestHandler):
         dur_ms = int((time.time() - t0) * 1000)
         if calls:
             finish = "tool_calls"
-        record_usage(label, "oai", total_usage, None, dur_ms, True, finish, "", cont)
+        record_usage(label, "oai", total_usage, None, dur_ms, True, finish, "", cont, pid=pid)
         msg = {"role": "assistant", "content": acc_text if acc_text or not calls else None}
         if calls:
             msg["tool_calls"] = calls
@@ -954,6 +986,7 @@ class H(BaseHTTPRequestHandler):
 
     def stream(self, model, payload, use_tool=False, label=None, has_client_tools=False):
         label = label or model
+        pid = pending_start(label, "oai-stream")
         t0 = time.time()
         name = new_tool_name() if use_tool else None
         plain_payload = payload
@@ -980,7 +1013,7 @@ class H(BaseHTTPRequestHandler):
         resp, ecode, gerr = open_upstream(payload)
         if resp is None:
             record_usage(label, "oai-stream", {}, None, int((time.time() - t0) * 1000), False, "",
-                         (gerr.get("error") or {}).get("message", "") if isinstance(gerr.get("error"), dict) else "")
+                         (gerr.get("error") or {}).get("message", "") if isinstance(gerr.get("error"), dict) else "", pid=pid)
             return self.err(ecode, gerr)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1158,7 +1191,7 @@ class H(BaseHTTPRequestHandler):
                      int((t_first - t0) * 1000) if t_first else None,
                      int((time.time() - t0) * 1000),
                      not stream_err and not disconnected, finish or "",
-                     stream_err or ("client disconnected" if disconnected else ""), cont)
+                     stream_err or ("client disconnected" if disconnected else ""), cont, pid=pid)
 
     def passthrough(self):
         # Front-door fallback: anything that is not an OpenAI route is proxied
@@ -1193,6 +1226,7 @@ class H(BaseHTTPRequestHandler):
             with resp:
                 if gm and gm.group(2) == "streamGenerateContent":
                     t0 = t_start
+                    pid = pending_start(gm.group(1), "native-stream")
                     t_first = None
                     last_usage = {}
                     fin = ""
@@ -1221,9 +1255,10 @@ class H(BaseHTTPRequestHandler):
                     record_usage(gm.group(1), "native-stream", last_usage,
                                  int((t_first - t0) * 1000) if t_first else None,
                                  int((time.time() - t0) * 1000),
-                                 resp.status == 200 and not gerr, fin, gerr)
+                                 resp.status == 200 and not gerr, fin, gerr, pid=pid)
                 elif gm:
                     t0 = t_start
+                    pid = pending_start(gm.group(1), "native")
                     raw = resp.read()
                     self.wfile.write(raw)
                     self.wfile.flush()
@@ -1239,7 +1274,7 @@ class H(BaseHTTPRequestHandler):
                         pass
                     record_usage(gm.group(1), "native", usage_meta, None,
                                  int((time.time() - t0) * 1000),
-                                 resp.status == 200 and not gerr, fin, gerr)
+                                 resp.status == 200 and not gerr, fin, gerr, pid=pid)
                 elif ctype and "text/html" in ctype:
                     raw = resp.read()
                     if b"</body>" in raw and b"taotao-usage-pill" not in raw:
