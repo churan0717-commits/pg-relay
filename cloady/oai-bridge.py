@@ -581,6 +581,67 @@ def _window(day):
     return start, start + timedelta(days=1)
 
 
+def _upstream_account_usage():
+    """按账号用量：桥自己的流水不带账号（本体不透传），改读本体总账——
+    rotator_state.json 的今日（洛杉矶日）分模型计数＋/api/accounts 账号信息。"""
+    data_dir = os.path.dirname(USAGE_FILE)
+    state = {}
+    try:
+        with open(os.path.join(data_dir, "rotator_state.json"), encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        state = {}
+    meta = {}
+    try:
+        req = urllib.request.Request(UPSTREAM + "/api/accounts")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            for a in json.loads(resp.read().decode("utf-8")):
+                if isinstance(a, dict) and a.get("id"):
+                    meta[a["id"]] = a
+    except Exception:
+        try:
+            with open(os.path.join(data_dir, "accounts", "registry.json"),
+                      encoding="utf-8") as f:
+                reg = json.load(f)
+            items = reg.get("accounts", reg) if isinstance(reg, dict) else reg
+            if isinstance(items, dict):
+                items = list(items.values())
+            for a in items or []:
+                if isinstance(a, dict) and a.get("id"):
+                    meta[a["id"]] = a
+        except Exception:
+            pass
+    out = []
+    now_s = time.time()
+    for aid in sorted(set(meta) | set(state)):
+        st = state.get(aid, {}) or {}
+        dm = st.get("daily_models", {}) or {}
+        tot = ok = fail = limited = prompt = completion = thoughts = 0
+        cd = 0.0
+        for m in dm.values():
+            tot += m.get("requests", 0)
+            ok += m.get("success", 0)
+            limited += m.get("rate_limited", 0)
+            fail += m.get("rate_limited", 0) + m.get("errors", 0)
+            prompt += m.get("prompt_tokens", 0)
+            completion += m.get("completion_tokens", 0)
+            thoughts += m.get("reasoning_tokens", 0)
+            cd = max(cd, m.get("cooldown_until", 0) or 0)
+        info = meta.get(aid, {})
+        out.append({"account": _mask(info.get("email") or info.get("name") or aid),
+                    "key": aid, "total": tot, "ok": ok, "fail": fail,
+                    "limited": limited,
+                    "prompt": prompt, "completion": completion,
+                    "thoughts": thoughts,
+                    "tier": info.get("tier", ""),
+                    "enabled": info.get("enabled", True),
+                    "cooldown_min": int((cd - now_s + 59) // 60) if cd > now_s else 0,
+                    "all_total": st.get("total_requests", 0),
+                    "all_ok": st.get("total_success", 0)})
+    out.sort(key=lambda a: -a["total"])
+    return out
+
+
 def usage_report(day):
     start, end = _window(day)
     s_ms, e_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
@@ -599,21 +660,10 @@ def usage_report(day):
         m["prompt"] += r["prompt"]
         m["completion"] += r["completion"]
         m["thoughts"] += r["thoughts"]
-    by_acct = {}
-    for r in rows:
-        key = r["account"] or "—"
-        a = by_acct.setdefault(key, {"account": _mask(key), "total": 0, "ok": 0, "fail": 0,
-                                     "prompt": 0, "completion": 0, "thoughts": 0})
-        a["total"] += 1
-        if _is_fail(r):
-            a["fail"] += 1
-        else:
-            a["ok"] += 1
-        a["prompt"] += r["prompt"]
-        a["completion"] += r["completion"]
-        a["thoughts"] += r["thoughts"]
-    for a in by_acct.values():
-        a["share"] = round(a["total"] / total * 100) if total else 0
+    by_acct = _upstream_account_usage()
+    acct_total = sum(a["total"] for a in by_acct)
+    for a in by_acct:
+        a["share"] = round(a["total"] / acct_total * 100) if acct_total else 0
     recs = sorted(rows, key=lambda r: -r["ts"])[:50]
     # 进行中的请求只进流水展示，不进汇总/按模型/按账号统计（还没结果）
     now_ms = int(time.time() * 1000)
@@ -629,7 +679,7 @@ def usage_report(day):
             "end": end.strftime("%m月%d日 %H:%M"),
             "summary": summary,
             "byModel": sorted(by_model.values(), key=lambda m: -m["total"]),
-            "byAccount": sorted(by_acct.values(), key=lambda a: -a["total"]),
+            "byAccount": by_acct,
             "pending": len(pend),
             "records": recs}
 
@@ -686,7 +736,7 @@ USAGE_PAGE = """<!DOCTYPE html>
     <div class="tok"><span>思考 token</span><b id="sThink" style="color:#047857">–</b></div>
   </div>
   <h3>按模型</h3><div class="card" id="byModel"><div class="empty">暂无记录</div></div>
-  <h3>按账号</h3><div id="byAccount"><div class="card"><div class="empty">暂无记录</div></div></div>
+  <h3>按账号 <span style="font-size:12px;color:#9ca3af;font-weight:400;">本体今日（美国日）总账</span></h3><div id="byAccount"><div class="card"><div class="empty">暂无记录</div></div></div>
   <h3>流水</h3><div class="card" id="records"><div class="empty">暂无记录</div></div>
 </div>
 <script>
@@ -719,7 +769,7 @@ USAGE_PAGE = """<!DOCTYPE html>
           +'<div style="margin-left:auto;text-align:right;"><b style="font-size:22px;line-height:1.1;">'+a.total+'</b>'
           +'<span style="display:block;font-size:11px;color:#9ca3af;">总请求</span></div></div>'
           +'<div class="bar"><i style="width:'+a.share+'%"></i></div>'
-          +'<div style="font-size:12px;color:#6b7280;margin-top:7px;">成功 '+a.ok+' · 失败 '+a.fail+' · 占比 '+a.share+'% · 输入 '+fmtTok(a.prompt)+' · 输出 '+fmtTok(a.completion)+' · 思考 '+fmtTok(a.thoughts)+'</div></div>';
+          +'<div style="font-size:12px;color:#6b7280;margin-top:7px;">成功 '+a.ok+' · 失败 '+a.fail+'（限流 '+a.limited+'） · 占比 '+a.share+'% · 输入 '+fmtTok(a.prompt)+' · 输出 '+fmtTok(a.completion)+' · 思考 '+fmtTok(a.thoughts)+' · 累计 '+a.all_total+' 发'+(a.cooldown_min>0 ? ' · <span style="color:#d97706;font-weight:600;">冷却中（剩约 '+a.cooldown_min+' 分钟）</span>' : '')+(a.enabled===false ? ' · 已禁用' : '')+'</div></div>';
       }).join('') : '<div class="card"><div class="empty">暂无记录</div></div>';
       var rc=document.getElementById('records');
       rc.innerHTML = d.records.length ? d.records.map(function(r){
