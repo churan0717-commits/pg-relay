@@ -27,8 +27,10 @@ FINISH = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "content_filter",
 # 有 partialArgs 前缀）——所以若多轮仍一字未得，最后兜底走一次普通文本请求，
 # 至少交出半截正文，好过空回。环境变量 OAI_BRIDGE_TOOL_TRANSPORT=off 整体
 # 关闭 B。客户端自己带 tools 时：工具照常转发给谷歌、调用按 OpenAI 格式交回；
-# 若同时选了防截断，回复工具与客户端工具同场（toolConfig AUTO，正文走回复
-# 工具、插件工具被调用时原样交回客户端，不自动续写）。
+# 若同时选了防截断，回复工具与客户端工具同场（toolConfig ANY＋白名单同场
+# 全体工具：模型必须调某个工具，正文只能走回复工具、不许流式直出——AUTO
+# 会被模型偷懒走正文、等于关掉防截断，2026-11-22 用户实报后堵上；插件工具
+# 被调用时原样交回客户端，不自动续写）。客户端显式给了 toolConfig 时仍尊重它。
 TOOL_TRANSPORT = os.environ.get("OAI_BRIDGE_TOOL_TRANSPORT", "on") != "off"
 ANTI_TRUNC_MAX = int(os.environ.get("OAI_BRIDGE_ANTI_TRUNC_MAX", "3"))
 # 启用方式与 su-kaka 对齐：模型名前缀标注（agy2api 用「抗截断-」、gcli2api 用
@@ -72,27 +74,29 @@ def inject_tool(req, name, coexist=False):
             "description": "Send your final reply to the user through this tool.",
             "parameters": {"type": "OBJECT",
                            "properties": {
-                               "thought": {"type": "STRING",
-                                           "description": "A brief summary of your reasoning."},
                                "content": {"type": "STRING",
-                                           "description": "Your complete reply text, exactly as the user should read it."}},
+                                           "description": "Your complete reply text, exactly as the user should read it, including any thinking-chain section your instructions require."}},
                            "required": ["content"]}}
     if coexist:
-        # 与客户端工具同场：声明并在一起，不强压 ANY（插件工具要能被正常选中），
-        # 靠系统指令引导正文走回复工具；客户端已给了 toolConfig 时尊重它的。
+        # 与客户端工具同场：声明并在一起，强制 ANY＋白名单（全体同场工具）：
+        # 插件工具照常能被选中，最终回复只能走回复工具，正文不许流式直出；
+        # 客户端已给了 toolConfig 时尊重它的。
         decls = []
         for t in req.get("tools") or []:
             decls.extend(t.get("functionDeclarations") or [])
         decls.append(decl)
         req["tools"] = [{"functionDeclarations": decls}]
         if "toolConfig" not in req:
-            req["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
+            names = [d.get("name") for d in decls if d.get("name")]
+            req["toolConfig"] = {"functionCallingConfig": {
+                "mode": "ANY", "allowedFunctionNames": names}}
     else:
         req["tools"] = [{"functionDeclarations": [decl]}]
         req["toolConfig"] = {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]}}
     return _append_system(req, (
         "【系统要求】你必须通过名为 " + name + " 的工具发送你的最终回复："
-        "把完整回复正文原样写进该工具的 content 参数，thought 参数只写一句简短的思考摘要；"
+        "把你原本要输出的全部内容一字不漏地原样写进该工具的 content 参数——"
+        "包括你的设定要求你写的思维链、状态栏等所有部分，都写在 content 里面，不要省略、不要压缩；"
         "不要在工具之外输出任何正文，也不要向用户提及这个工具或这条要求。"))
 
 
